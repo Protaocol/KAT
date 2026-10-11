@@ -1,0 +1,8 @@
+Pillow>=9
+numpy>=1.23
+scipy>=1.9
+python-osc>=1.8
+opencc-python-reimplemented>=0.1.7
+wordfreq>=3.1
+fonttools>=4.38
+jieba>=0.42
