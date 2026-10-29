@@ -1,0 +1,39 @@
+{
+  "format": 1,
+  "text_length": 128,
+  "line_length": 32,
+  "line_count": 4,
+  "sync_params_default": 4,
+  "sync_params_min": 2,
+  "sync_params_max": 16,
+  "sync_params_allowed_even": [
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14,
+    16
+  ],
+  "symbols": 255,
+  "slots_per_page": 255,
+  "page_base": 15,
+  "page_format": 2,
+  "page_formats": {
+    "2": {
+      "pages_per_float": 2,
+      "max_page": 14,
+      "bits_per_slot": 12
+    },
+    "3": {
+      "pages_per_float": 1,
+      "max_page": 253,
+      "bits_per_slot": 16
+    }
+  },
+  "narrow_cells": 128,
+  "wide_pages": 14,
+  "follow_symbol": 254,
+  "pointer_clear": 255
+}

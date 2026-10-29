@@ -1,0 +1,63 @@
+# KAT install config (optional).
+#
+# Drop this file (import it as a TextAsset; any .txt works) into the "Config file (optional)" slot of the
+# Tools > KillFrenzy Avatar Text (KAT) window, then press Install/Update KAT. Leave the slot empty for the stock
+# defaults. Everything below is optional (delete any line you do not need). '#' starts a comment.
+# Numbers use '.' as the decimal point; vectors are 3 numbers separated by spaces or commas.
+# Uncomment a line to use it: every value shown is the shipped default unless the comment says otherwise.
+
+[settings]
+# Where the four radial anchor points sit, in the yaw-stabilised frame of the chest / head bone (x y z, metres).
+# headAnchorOffset      = -0.4 0.15 0.15
+# rightHeadAnchorOffset = 0.4 0.15 0.15
+# topHeadAnchorOffset   = 0 0.45 0.15
+# chestAnchorOffset     = 0 0 0.2
+
+[material]
+# Shader material defaults. Uncomment only the properties you want the installer to write.
+# Runtime-driven properties (_Tail, _Scale, _Padding, _CornerRadius, _BorderWidth, _OutlineWidth) can still be
+# given an install-time starting value; the animator owns them after its layer runs.
+# _MainColor       = (1, 1, 1, 1)
+# _ShadowColor     = (0, 0, 0, 1)
+# _OutlineWidth    = 0.0
+# _Weight          = 0
+# _GrowEnabled     = 1
+# _GrowStart       = 0.5
+# _GrowEnd         = 1.5
+# _GrowAmount      = 1
+# _ExtentScanSlots = 128
+# _BoxEnabled      = 1
+# _ShrinkToFit     = 1
+# _BackColor       = (0, 0, 0, 0.55)
+# _BorderColor     = (1, 1, 1, 0.9)
+# _BorderWidth     = 0.14
+# _Padding         = 0.5
+# _CornerRadius    = 0.5
+# _Scale           = 1
+# _AnchorX         = 0.5
+# _AnchorY         = 0
+# _TailWidth       = 1.6
+# _TailHeight      = 2
+# _TailLean        = 0.35
+# _TailMargin      = 0.4
+# _TailSide        = 0
+# _DebugFillEnabled / _DebugFillPage / _DebugFillSlot / _DebugFillColumns / _DebugFillRows are diagnostic fields
+# and are reset to zero by the installer.
+[transforms]
+# Local position / rotation (euler degrees) / scale of any object the installer creates, by name. Applied last, so
+# they win over the built-in offsets and over [settings]. Names that do not exist for your options (for instance the
+# head objects when no head bone is found) are reported in the Console.
+#
+#   Below is a list of objects you are probably looking for
+#
+#   KAT_Text_AttachmentPoint            KAT_Text_AttachmentPoint_Target     (the chest source #0)
+#   KAT_Head_AttachmentPoint            KAT_Head_AttachmentPoint_ScalePivot KAT_Head_AttachmentPoint_Target
+#   KAT_Head_AttachmentPoint_RightTarget KAT_Head_Top_Pivot
+#   KAT_Keyboard_AttachmentPoint        KAT_Keyboard_AttachmentPoint_Target (only with the keyboard)
+#   Text                                (the text quad itself; its scale is the panel size)
+#
+# KAT_Head_AttachmentPoint_Target.position = -0.4 0.15 0.15
+# KAT_Head_AttachmentPoint_RightTarget.position = 0.4 0.15 0.15
+# KAT_Head_Top_Pivot.position = 0 0.45 0.15
+# KAT_Text_AttachmentPoint_Target.position = 0 0 0.2
+# Text.scale = 0.5 0.1666667 1
