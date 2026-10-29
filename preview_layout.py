@@ -109,12 +109,40 @@ def _page_files(folder):
     return [found[i] for i in range(len(found))]
 
 
+def _color_files(folder):
+    """The emoji pages, color_page_<n>.png, in numeric order."""
+    import re
+    found = {}
+    for f in glob.glob(f"{folder}/color_page_*.png"):
+        mt = re.fullmatch(r"color_page_(\d+)\.png", f.replace("\\", "/").rsplit("/", 1)[-1])
+        if mt:
+            found[int(mt.group(1))] = f
+    return [found[i] for i in sorted(found)]
+
+
 _files = _page_files(args.atlas)
+_cfiles = _color_files(args.atlas)
 NP = len(_files)
-need = cs.pages
+need = cs.sdf_pages
 if NP < need:
     raise SystemExit(f"atlas has {NP} pages but the charset needs {need} (format {FMT}); wrong atlas folder?")
+if len(_cfiles) < cs.color_page_count:
+    raise SystemExit(f"atlas has {len(_cfiles)} emoji pages but the charset needs {cs.color_page_count}; wrong atlas folder, or it was built without the emoji?")
 _atlas_cache = {}
+_color_cache = {}
+_LAST_COLOR = {}
+
+
+def get_color_page(i):
+    if i not in _color_cache:
+        _color_cache[i] = np.asarray(Image.open(_cfiles[i]).convert("RGBA"), dtype=np.float32) / 255
+    return _color_cache[i]
+
+
+def sample_color(i, u, v):
+    a = get_color_page(i); H, W = a.shape[:2]
+    coords = [(1 - v) * H - 0.5, u * W - 0.5]
+    return np.stack([map_coordinates(a[..., c], coords, order=1, mode="nearest") for c in range(4)], -1)
 
 
 def get_page(i):
@@ -198,12 +226,19 @@ def slot_sd(g):
     wx = ((sym & 15) + np.where(right, 0.5, 0) + local[..., 0] * 0.5) / 16; wy = ((sym >> 4) + local[..., 1]) / 16
     ux = np.where(narrow, nx, wx); uy = np.where(narrow, ny, wy)
     out = np.zeros(slot.shape)
+    rgba = np.zeros(slot.shape + (4,)); is_color = np.zeros(slot.shape, bool)
     for pg in np.unique(page[~blank]):
         pg = int(pg)
+        sel = (page == pg) & ~blank
+        if cs.has_color and cs.color_first_page <= pg < cs.color_first_page + cs.color_page_count:
+            # an emoji page: read the RGBA as it is, in the same cell layout as a wide page (what the shader's isColor path does)
+            rgba[sel] = sample_color(pg - cs.color_first_page, ux[sel], 1 - uy[sel])
+            is_color |= sel
+            continue
         if pg >= NP:
             raise SystemExit(f"text uses page {pg} but the atlas only has {NP} pages")
-        sel = (page == pg) & ~blank
         out[sel] = sample(pg, ux[sel], 1 - uy[sel])
+    _LAST_COLOR["rgba"], _LAST_COLOR["mask"] = rgba, is_color
     return out
 
 
@@ -242,6 +277,7 @@ def tri_dist(Pp, A, B, C):
 
 g0, Q0, bs, pad = layout(xs, ys)
 sd = slot_sd(g0)
+_glyph_rgba, _glyph_is_color = _LAST_COLOR["rgba"], _LAST_COLOR["mask"]
 sdx = slot_sd(layout(xs + 1, ys)[0]); sdy = slot_sd(layout(xs, ys + 1)[0])
 aa = np.maximum(np.abs(sdx - sd) + np.abs(sdy - sd), 1e-3)
 fill = np.clip((sd - (0.5 - _Weight)) / aa + 0.5, 0, 1)
@@ -249,6 +285,9 @@ outer = np.clip((sd - (0.5 - _Weight - _OutlineWidth)) / aa + 0.5, 0, 1)
 ratio = (fill / np.maximum(outer, 1e-4))[..., None]
 text_rgb = _ShadowColor[:3] * (1 - ratio) + _MainColor[:3] * ratio
 text_a = outer * _MainColor[3]
+if _glyph_is_color.any():      # emoji keep their own colours; the text colour only contributes its alpha
+    text_rgb = np.where(_glyph_is_color[..., None], _glyph_rgba[..., :3], text_rgb)
+    text_a = np.where(_glyph_is_color, _glyph_rgba[..., 3] * _MainColor[3], text_a)
 
 d = box_dist(Q0, bs)
 dx = box_dist(layout(xs + 1, ys)[1], bs); dy = box_dist(layout(xs, ys + 1)[1], bs)

@@ -20,6 +20,20 @@ Page format (--format 2|3, default 2)
      installer's "Unpacked page format (format 3)" checkbox). --count is bounded by the chosen format.
   The format is written into charset.json; every other tool reads it from there.
 
+Emoji (optional, shown in full colour; see kat_emoji.py)
+  --emoji "😭😂❤️"     emoji to include, typed right here
+  --emoji-dir DIR      folder of images; the file name is the shortcode, so DIR/sob.png lets people type :sob:
+  Emoji live on their own pages after the wide text pages, and those pages count towards the page limit: in format 2 the wide
+  text pages plus the emoji pages have to fit in 14 (a page holds 255 glyphs). So one emoji page costs you 255 wide characters.
+  The tool reserves the page for you and says how much to lower --count if the text no longer fits.
+  In the client, :sob: is 5 characters but becomes one glyph that takes two slots, like any wide glyph.
+
+Symbols (format 3)
+  When the format has loads of room left over after the ranked characters, the charset also gets a block of symbols: roman
+  numerals, circled numbers, arrows, math signs, shapes, box drawing and so on (see SYMBOLS). --symbols auto (the default) does
+  this in format 3 when at least SYMBOLS_MIN_FREE wide slots are still free; "on" always adds them, "off" never does.
+  Pass --symbols-font with your wide font and only the symbols that font can actually draw are added.
+
 Layout rules
   narrow set (page 0, 1:2 cells, max 128)   ASCII 32..126 + euro + degree by default (--narrow to replace)
   wide set (pages 1..N, square cells, max 3570 in format 2 / 64515 in format 3, each drawn over TWO slots)
@@ -38,11 +52,35 @@ from collections import Counter
 
 from kat_codec import (NARROW_CELLS, PAGE_FORMAT_DEFAULT, SLOTS_PER_PAGE, Charset, check_format, max_wide,
                        required_page_format, wide_pages)
+from kat_emoji import collect_emoji
 from kat_protocol import PAGE_FORMATS, bits_per_slot
 
 DEFAULT_PATTERN = r"[\u4e00-\u9fff]"
 NARROW_BASE = "".join(chr(c) for c in range(32, 127)) + "€°"
 WIDE_PUNCT = "，。、；：？！“”‘’（）《》【】—…·「」『』～"
+
+
+def _span(first: int, last: int) -> str:
+    return "".join(chr(c) for c in range(first, last + 1))
+
+
+# Extra symbols for charsets with space to spare (format 3). They're always put in the wide set, even though some of them
+# are "ambiguous width" in Unicode, because in a CJK font they're drawn full width anyway.
+SYMBOLS = (
+    _span(0x2160, 0x217F)                 # roman numerals  Ⅰ Ⅱ Ⅲ ... ⅰ ⅱ ⅲ ...
+    + _span(0x2460, 0x249B)               # circled, bracketed and dotted numbers  ① ⑴ ⒈
+    + _span(0x2776, 0x277F)               # ❶ ... ❿
+    + _span(0x3220, 0x3229)               # ㈠ ... ㈩
+    + _span(0x3280, 0x3289)               # ㊀ ... ㊉
+    + _span(0x2190, 0x2199) + _span(0x21D0, 0x21D5)       # arrows
+    + "±×÷≠≈≤≥∞∑∏√∫∂∆∈∉∩∪⊂⊃∠⊥∥∴∵∝≡≒⊕⊗∀∃∅∧∨¬"      # maths
+    + "■□▲△▼▽◆◇○●◎◐◑★☆"                  # shapes
+    + "♀♂♠♣♥♦♪♫♭♯✓✗"                        # cards, music, ticks
+    + "℃℉㎡㎝㎞㎏％‰′″※№℡㈱＄￥￠￡§¶†‡•◦"      # units, currency, document marks
+    + _span(0x2500, 0x257F)               # box drawing
+)
+SYMBOL_SET = frozenset(SYMBOLS)
+SYMBOLS_MIN_FREE = 4000                   # "auto" adds the symbols only if at least this many wide slots are still free
 
 
 def _is_wide_char(ch: str) -> bool:
@@ -51,10 +89,18 @@ def _is_wide_char(ch: str) -> bool:
 
 def build_sets(ranked: list[str], count: int | None = None, extra: str = "",
                punct: str = WIDE_PUNCT, narrow_base: str = NARROW_BASE,
-               page_format: int = PAGE_FORMAT_DEFAULT) -> tuple[str, str]:
-    """-> (narrow, wide) glyph strings. `count` limits how many ranked chars are added.
-    Capacity is per page format: 3570 wide glyphs in format 2, 64515 in format 3."""
+               page_format: int = PAGE_FORMAT_DEFAULT, reserved_pages: int = 0,
+               symbols: str = "auto", symbol_ok=None, exclude: str = "") -> tuple[str, str]:
+    """Returns (narrow, wide) as strings of glyphs. `count` caps how many of the ranked characters get added.
+    Room is 3570 wide glyphs in format 2 and 64515 in format 3. `reserved_pages` wide pages are kept free for emoji pages,
+    since those use page numbers too. `symbols` is "auto" / "on" / "off" (see SYMBOLS); `symbol_ok(ch)` can veto a symbol, and
+    anything in `exclude` (say, the emoji) is never added as text."""
     check_format(page_format)
+    exclude = set(exclude)                       # emoji beat plain text glyphs: a text copy of one is simply dropped
+    ranked = [c for c in ranked if c not in exclude]
+    extra = "".join(c for c in extra if c not in exclude)
+    punct = "".join(c for c in punct if c not in exclude)
+    capacity = max_wide(page_format) - reserved_pages * SLOTS_PER_PAGE
     narrow = list(dict.fromkeys(narrow_base))
     wide = [c for c in dict.fromkeys(punct) if c not in narrow]
     seen = set(narrow) | set(wide)
@@ -73,14 +119,28 @@ def build_sets(ranked: list[str], count: int | None = None, extra: str = "",
         if ch not in seen:
             add(ch)
             picked += 1
+    if symbols not in ("auto", "on", "off"):
+        raise ValueError("symbols must be auto, on or off")
+    free = capacity - len(wide)
+    if symbols == "on" or (symbols == "auto" and page_format == 3 and free >= SYMBOLS_MIN_FREE):
+        for ch in dict.fromkeys(SYMBOLS):
+            if len(wide) >= capacity:
+                break
+            if ch in seen or ch in exclude or (symbol_ok is not None and not symbol_ok(ch)):
+                continue
+            wide.append(ch)                  # straight into wide, whatever its Unicode width says
+            seen.add(ch)
     if len(narrow) > NARROW_CELLS:
         raise ValueError(f"{len(narrow)} narrow glyphs > {NARROW_CELLS} cells; lower --count / trim --extra "
                          f"(scripts like Cyrillic or Greek are narrow and share page 0 with ASCII)")
-    if len(wide) > max_wide(page_format):
-        need = required_page_format(len(wide))
+    if len(wide) > capacity:
+        need = required_page_format(len(wide) + reserved_pages * SLOTS_PER_PAGE)
         hint = f"; lower --count, or use --format {need}" if need and need != page_format else "; lower --count"
-        raise ValueError(f"format {page_format}: {len(wide)} wide glyphs > {max_wide(page_format)} "
-                         f"({wide_pages(page_format)} pages x {SLOTS_PER_PAGE}){hint}")
+        if reserved_pages:
+            hint = (f"; {reserved_pages} page(s) are kept free for emoji, so lower --count by "
+                    f"{len(wide) - capacity}" + (f", or use --format {need}" if need and need != page_format else ""))
+        raise ValueError(f"format {page_format}: {len(wide)} wide glyphs > {capacity} "
+                         f"({wide_pages(page_format) - reserved_pages} pages x {SLOTS_PER_PAGE}){hint}")
     return "".join(narrow), "".join(wide)
 
 
@@ -215,15 +275,24 @@ def main() -> int:
     ap.add_argument("--extra", default="", help="characters to force-include")
     ap.add_argument("--punct", default=WIDE_PUNCT, help="always-wide punctuation set (default: Chinese)")
     ap.add_argument("--narrow", default=NARROW_BASE, help="always-narrow base set (default: ASCII + euro + degree)")
+    ap.add_argument("--emoji", default="", help='emoji to include, typed here, e.g. "😭😂❤️"')
+    ap.add_argument("--emoji-dir", help="folder of emoji images; the file name is the shortcode (sob.png -> :sob:)")
+    ap.add_argument("--symbols", choices=("auto", "on", "off"), default="auto",
+                    help="roman numerals, arrows, maths and similar symbols: auto = only in format 3 when there's plenty of room")
+    ap.add_argument("--symbols-font", help="your wide font: only symbols it can draw get added")
+    ap.add_argument("--symbols-font-index", type=int, default=0)
     ap.add_argument("-o", "--out", default="charset.json")
     args = ap.parse_args()
 
     return generate(freq=args.freq, corpus=args.corpus, pattern=args.pattern, fmt=args.format, count=args.count,
-                    extra=args.extra, punct=args.punct, narrow=args.narrow, out=args.out)
+                    extra=args.extra, punct=args.punct, narrow=args.narrow, out=args.out,
+                    emoji=args.emoji, emoji_dir=args.emoji_dir, symbols=args.symbols,
+                    symbols_font=args.symbols_font, symbols_font_index=args.symbols_font_index)
 
 
 def generate(*, freq=None, corpus=None, pattern=DEFAULT_PATTERN, fmt=PAGE_FORMAT_DEFAULT, count=None,
-             extra="", punct=WIDE_PUNCT, narrow=NARROW_BASE, out="charset.json") -> int:
+             extra="", punct=WIDE_PUNCT, narrow=NARROW_BASE, out="charset.json",
+             emoji="", emoji_dir=None, symbols="auto", symbols_font=None, symbols_font_index=0) -> int:
     if freq:
         ranked = ranked_from_freq_file(freq, pattern)
     else:
@@ -232,16 +301,35 @@ def generate(*, freq=None, corpus=None, pattern=DEFAULT_PATTERN, fmt=PAGE_FORMAT
         ranked = [ch for ch, _ in counts.most_common()]
 
     try:
-        narrow_set, wide_set = build_sets(ranked, count, extra, punct, narrow, page_format=fmt)
-        cs = Charset(narrow_set, wide_set, page_format=fmt)
-    except ValueError as e:
+        emojis = collect_emoji(inline=emoji, emoji_dir=emoji_dir)
+        symbol_ok = None
+        if symbols_font:
+            from PIL import ImageFont
+            from build_atlas import missing_glyphs      # imported here because build_atlas imports this module
+            lacking = set(missing_glyphs(ImageFont.truetype(symbols_font, 48, index=symbols_font_index), SYMBOLS))
+            symbol_ok = lambda ch: ch not in lacking
+        narrow_set, wide_set = build_sets(ranked, count, extra, punct, narrow, page_format=fmt, reserved_pages=emojis.pages(),
+                                          symbols=symbols, symbol_ok=symbol_ok, exclude=set(emojis.color))
+        cs = Charset(narrow_set, wide_set, page_format=fmt, color=emojis.color, emoji_aliases=emojis.aliases,
+                     color_sources=emojis.sources, emoji_synonyms=emojis.synonyms)
+    except (ValueError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    pages = cs.pages
+    pages = cs.sdf_pages
     with open(out, "w", encoding="utf-8") as f:
         json.dump(cs.to_json_dict(), f, ensure_ascii=False)
     print(f"format {fmt}: narrow {len(narrow_set)}/{NARROW_CELLS}, wide {len(wide_set)}/{max_wide(fmt)} -> {pages} atlas page(s)  ({out})")
+    symbol_count = sum(1 for ch in wide_set if ch in SYMBOL_SET)
+    if symbol_count >= 100:
+        print(f"symbols: {symbol_count} (roman numerals, arrows, maths, shapes, box drawing...)")
+    if cs.has_color:
+        if emojis.overridden:
+            print(f"pictures from the emoji folder replace the font for: {' '.join(emojis.overridden)}")
+        for dup, owner in emojis.merged:
+            print(f"identical picture, shares a glyph: {dup} -> {owner}")
+        print(f"emoji: {len(cs.color)} ({len(cs.emoji_aliases)} with a shortcode) on {cs.color_page_count} emoji page(s) "
+              f"starting at page {cs.color_first_page}; wide + emoji pages = {cs.pages - 1}/{wide_pages(fmt)}")
     if count is not None and len(ranked) < count:
         print(f"note: only {len(ranked)} ranked characters were available (asked for {count})")
     if fmt == 3:
@@ -250,6 +338,10 @@ def generate(*, freq=None, corpus=None, pattern=DEFAULT_PATTERN, fmt=PAGE_FORMAT
             print(f"WARNING: only {len(wide_set)} wide glyphs -- that fits format 2 ({max_wide(2)}). Format 3 costs more "
                   "wire bits, animator layers and clips for headroom you are not using. Drop --format 3 unless you plan to grow.")
     print_vram(pages)
+    if cs.has_color:
+        for cell in (32, 48, 64):
+            print(f"  emoji pages at cell {cell}px: {vram_mb(cs.color_page_count, cell, 1.0):.1f} MB as BC7 "
+                  f"({vram_mb(cs.color_page_count, cell, 4.0):.1f} MB if it falls back to RGBA32)")
     return 0
 
 

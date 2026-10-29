@@ -58,16 +58,19 @@ def symbol_to_float_range(v: float) -> int:
 class Charset:
     """Minimal mirror of kat_codec.Charset, for turning glyph indices back into text."""
 
-    def __init__(self, narrow: str, wide: str, page_format: int = 2):
+    def __init__(self, narrow: str, wide: str, page_format: int = 2, color: list | None = None):
         self.narrow = narrow
         self.wide = wide
         self.page_format = page_format
+        self.color = list(color or [])
+        # emoji sit on the pages right after the wide text pages
+        self.color_first = 1 + -(-len(wide) // 255)
 
     @classmethod
     def load(cls, path: str) -> "Charset":
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
-        return cls(d["narrow"], d["wide"], read_charset_format(d))
+        return cls(d["narrow"], d["wide"], read_charset_format(d), d.get("color"))
 
     def char_at(self, glyph_index: int) -> str:
         if 0 <= glyph_index < len(self.narrow):
@@ -75,6 +78,9 @@ class Charset:
         j = glyph_index - WIDE_START
         if 0 <= j < len(self.wide):
             return self.wide[j]
+        k = glyph_index - self.color_first * 255
+        if 0 <= k < len(self.color):
+            return self.color[k]
         return ""  # FOLLOW marker or unassigned cell
 
 

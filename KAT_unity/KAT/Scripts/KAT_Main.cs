@@ -63,7 +63,8 @@ namespace KillFrenzy.AvatarTextTools
 		[SerializeField] private int pageFormatChoice = 0; // 0 = Auto (follow the built glyph atlas), 1 = format 2, 2 = format 3
 		[SerializeField] private bool useWriteDefaultsOn = false;
 		[SerializeField] private int slotCount = 128;
-		[SerializeField] private bool installStyleSpeed = true;
+		[SerializeField] private bool installBoardControls = false; // hold the board in a hand, drop it in the world, or drop it and let it follow you (needs VRC constraints, SDK 3.5+)
+		[SerializeField] private bool installAdvancedMenu = false; // adds an "Advanced" submenu of material tweaks inside "KAT Text" (the KAT Text menu itself is always installed)
 		[SerializeField] private TextAsset configFile = null; // optional KAT_Config.txt, see KAT_Config.example.txt
 
 		[SerializeField] private int tab = 0;
@@ -395,7 +396,7 @@ namespace KillFrenzy.AvatarTextTools
 
 		private KatSettings GetKatSettings(int sdk) {
 			int syncParams = 1 << (Mathf.Clamp(syncParamSize, 0, SyncChoices.Length - 1) + 1);
-			return new KatSettings(sdk, installKeyboard != 0, attachmentPoint, syncParams, useWriteDefaultsOn: useWriteDefaultsOn, slotCount: slotCount, installStyleSpeedControls: installStyleSpeed, config: GetConfig(),
+			return new KatSettings(sdk, installKeyboard != 0, attachmentPoint, syncParams, useWriteDefaultsOn: useWriteDefaultsOn, slotCount: slotCount, installAdvancedMenu: installAdvancedMenu, installBoardControls: installBoardControls && KatBoard.IsAvailable(), config: GetConfig(),
 				pageFormat: ResolvePageFormat());
 		}
 
@@ -499,10 +500,25 @@ namespace KillFrenzy.AvatarTextTools
 
 			#if VRC_SDK_VRCSDK3
 				EditorGUILayout.Space();
-				installStyleSpeed = EditorGUILayout.Toggle(
-					new GUIContent("Text style / roll speed menu controls",
-						"KAT_Style and KAT_Speed are local floats (8 bits each). Untick to save 16 total expression bits; the style/head-scale layers are then skipped and the client's roll speed cannot be set from the menu."),
-					installStyleSpeed);
+				installAdvancedMenu = EditorGUILayout.Toggle(
+					new GUIContent("Install advanced menu",
+						"Adds an \"Advanced\" submenu inside the \"KAT Text\" menu (which is always installed: anchor, text style, roll speed). " +
+						"Advanced has finer toggles for the text material: billboard always/never (_FaceViewer override), grow with distance, box, shrink box to text, bold text, board size radial. " +
+						"All are local-only parameters (no synced bits): 1 int + 4 bool + 1 float expression parameters and 6 small animator layers."),
+					installAdvancedMenu);
+
+				bool boardAvailable = KatBoard.IsAvailable();
+				EditorGUI.BeginDisabledGroup(!boardAvailable);
+				installBoardControls = EditorGUILayout.Toggle(
+					new GUIContent("Install board controls (hold / drop)",
+						"Adds a \"Board\" submenu inside \"KAT Text\": hold the board in the left or right hand, drop it in the world, or drop it so it follows you. " +
+						"Uses a VRC Parent Constraint on the text (SDK 3.5+, Freeze To World). Costs one synced int (8 bits), 1 expression parameter and 1 animator layer. " +
+						"Requires a humanoid avatar. Experimental: check it in-game."),
+					installBoardControls && boardAvailable);
+				EditorGUI.EndDisabledGroup();
+				if (!boardAvailable) {
+					EditorGUILayout.HelpBox("Board controls need VRC constraints (VRCParentConstraint): update the VRChat SDK to 3.5+ on Unity 2022.", MessageType.Info);
+				}
 
 				if (installKeyboard != 0) {
 					EditorGUILayout.HelpBox(

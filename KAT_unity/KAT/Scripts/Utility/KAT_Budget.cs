@@ -42,13 +42,14 @@ namespace KillFrenzy.AvatarTextTools.Utility
 			int sync = s.SyncParamsSize;
 			int pages = s.GetPageSyncCount();
 			bool keyboard = s.InstallKeyboard && s.SDK == KatSDK.VRChat;
-			bool styleSpeed = s.InstallStyleSpeedControls;
+			bool board = s.InstallBoardControls;          // KAT_Board_Mode, one synced int
+			int advanced = s.InstallAdvancedMenu ? 6 : 0; // KAT_Adv_*: 1 int, 4 bools and 1 float, all local
 
 			KatBudget b = new KatBudget();
 			// Visible (bool 1) + Pointer (int 8) + CharSync floats + PageSync floats + HeadAnchor radial (float 8) [+ keyboard toggle 1]
-			b.syncedBits = 1 + 8 + 8 * sync + 8 * pages + 8 + (keyboard ? 1 : 0);
-			b.localExpressionBits = styleSpeed ? 16 : 0; // KAT_Speed + KAT_Style, float, not synced
-			b.expressionEntries = 3 + sync + pages + (keyboard ? 1 : 0) + (styleSpeed ? 2 : 0);
+			b.syncedBits = 1 + 8 + 8 * sync + 8 * pages + 8 + (keyboard ? 1 : 0) + (board ? 8 : 0);
+			b.localExpressionBits = 16 + (s.InstallAdvancedMenu ? 8 + 4 + 8 : 0); // KAT_Speed and KAT_Style (floats) plus the advanced menu's int, bools and float; none of them are synced
+			b.expressionEntries = 3 + sync + pages + (keyboard ? 1 : 0) + 2 + advanced + (board ? 1 : 0);
 
 			int keyboardLocal = keyboard ? 7 + s.KeyboardKeysCount : 0; // contacts + pressed-key floats written by the keyboard prefab
 			int memory = writeDefaultsOn ? s.SlotCount + s.GetPageCellCount(s.SlotCount) + 1 : 0;

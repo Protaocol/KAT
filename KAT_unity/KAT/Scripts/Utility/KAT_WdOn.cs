@@ -283,6 +283,7 @@ namespace KillFrenzy.AvatarTextTools.Utility
                         alternateTree
                     );
                     state.writeDefaultValues = true;
+                    AddAlternateHoldTransition(sm, idle, altPointer, settings.ParamTextSyncPrefix + (charIndex % settings.SyncParamsSize), settings.KeyboardBackspaceMode, settings);
                     AddAnyStateExactTransition(sm, state, altPointer, settings.ParamTextPointer);
                 }
 
@@ -389,6 +390,39 @@ namespace KillFrenzy.AvatarTextTools.Utility
                 AddAnyStateExactTransition(sm, state, group + 1, settings.ParamTextPointer);
             }
 
+            bool keyboardAlt = settings.InstallKeyboard && settings.PointerAltSyncOffset != 0;
+            if (keyboardAlt)
+            {
+                // The in-game keyboard writes one slot at a time, so the page cell of that slot (a pair of slots in format 2) needs alternate pointer states too.
+                bool cellPerSlot = settings.PageFormat == KatSettings.PageFormat3;
+                for (int slot = 0; slot < settings.SlotCount; slot++)
+                {
+                    int pageIndex = cellPerSlot ? slot : slot / 2;
+                    if (pageIndex >= pageCount) continue;
+
+                    BlendTree alternateTree = CreateDirectMemoryTree(
+                        controller,
+                        TreePrefix + "PageAlternateTree_" + slot,
+                        selfTrees,
+                        settings.ParamTextWdOnAlwaysOne
+                    );
+                    ReplaceMotion(alternateTree, pageIndex, writeTrees[pageIndex], settings.ParamTextWdOnAlwaysOne);
+
+                    int altPointer = settings.PointerAltSyncOffset + slot + 1;
+                    AnimatorState state = KatAnimatorInstaller.CreateState(
+                        sm,
+                        "Alternate " + altPointer + " Page" + pageIndex,
+                        new Vector3(1050f, 100f + 18f * slot, 0f),
+                        alternateTree
+                    );
+                    state.writeDefaultValues = true;
+                    AddAlternateHoldTransition(sm, idle, altPointer, settings.ParamTextPageSyncPrefix + (pageIndex % stride), settings.KeyboardPageHold, settings);
+                    AddAnyStateExactTransition(sm, state, altPointer, settings.ParamTextPointer);
+                }
+
+                AddAnyStateEqualsTransition(sm, idle, settings.PointerAltSyncOffset, settings.ParamTextPointer);
+            }
+
             AnimatorState clear = KatAnimatorInstaller.CreateState(
                 sm,
                 "Clear Pages",
@@ -399,7 +433,7 @@ namespace KillFrenzy.AvatarTextTools.Utility
             AddAnyStateExactTransition(sm, clear, 255, settings.ParamTextPointer);
 
             AddAnyStateEqualsTransition(sm, idle, 0, settings.ParamTextPointer);
-            AddInvalidPointerRecoveryTransitions(sm, idle, settings, false);
+            AddInvalidPointerRecoveryTransitions(sm, idle, settings, keyboardAlt);
 
             return layer;
         }
@@ -411,7 +445,7 @@ namespace KillFrenzy.AvatarTextTools.Utility
             bool allowAlternatePointers
         )
         {
-            // Valid values are 0, 1..groupCount, 255, and optionally the alternate character-pointer range [offset+1, offset+128]. Any other value returns to idle. The page layer does NOT allow alternate pointers.
+            // Valid values are 0, 1..groupCount, 255, and optionally the alternate character-pointer range [offset+1, offset+128]. Any other value returns to idle. The page layer allows them too, so the in-game keyboard can set a slot's page.
             int groups = settings.GetGroupCount();
             int altEnd = settings.PointerAltSyncOffset + settings.SlotCount;
 
@@ -576,6 +610,25 @@ namespace KillFrenzy.AvatarTextTools.Utility
             }
             AssetDatabase.AddObjectToAsset(clip, controllerPath);
             return clip;
+        }
+
+        // The in-game keyboard's Backspace puts a "hold" value on a sync channel to mean "don't write this slot". With the pointer on that slot and the
+        // channel at the hold value, stay on the memory decoder instead of writing.
+        private static void AddAlternateHoldTransition(
+            AnimatorStateMachine sm,
+            AnimatorState idle,
+            int altPointer,
+            string syncParam,
+            float holdValue,
+            KatSettings settings
+        )
+        {
+            AnimatorStateTransition transition = sm.AddAnyStateTransition(idle);
+            transition.duration = 0f;
+            transition.canTransitionToSelf = false;
+            transition.AddCondition(AnimatorConditionMode.Equals, altPointer, settings.ParamTextPointer);
+            transition.AddCondition(AnimatorConditionMode.Greater, holdValue - 0.005f, syncParam);
+            transition.AddCondition(AnimatorConditionMode.Less, holdValue + 0.005f, syncParam);
         }
 
         private static void AddAnyStateExactTransition(

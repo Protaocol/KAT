@@ -280,6 +280,10 @@ namespace KillFrenzy.AvatarTextTools.Utility
 
 			GameObject.DestroyImmediate(textObject.GetComponent<MeshCollider>());
 
+			if (settings.InstallBoardControls) {
+				KatBoard.InstallConstraint(avatarRootTransform, textObject.transform, settings);
+			}
+
 			MeshRenderer textRenderer = textObject.GetComponent<MeshRenderer>();
 			textRenderer.material = textMaterial;
 
@@ -352,6 +356,7 @@ namespace KillFrenzy.AvatarTextTools.Utility
 			}
 
 			RemoveStaleAttachmentPoints(avatarRootTransform, settings);
+			KatBoard.RemoveTargets(avatarRootTransform, settings);   // the hand and follow targets the board controls added
 
 			EditorSceneManager.MarkSceneDirty(avatarRootTransform.gameObject.scene);
 			Debug.Log("Removal of objects from avatar completed.");

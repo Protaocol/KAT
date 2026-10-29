@@ -38,12 +38,48 @@ def load_charset(path: Path) -> tuple[dict, int, int]:
     d = json.loads(path.read_text(encoding="utf-8"))
     from kat_codec import Charset, read_charset_format
     fmt = read_charset_format(d)
-    cs = Charset(d["narrow"], d["wide"], page_format=fmt)
-    return d, fmt, cs.pages
+    cs = Charset(d["narrow"], d["wide"], page_format=fmt, color=d.get("color"), emoji_aliases=d.get("emoji_aliases"),
+                 color_sources=d.get("color_sources"), emoji_synonyms=d.get("emoji_synonyms"))
+    return d, fmt, cs
 
 
-def check_atlas(atlas: Path, charset_hash: str, fmt: int, expected_pages: int) -> list[str]:
+def check_color_pages(atlas: Path, expected: int) -> list[str]:
+    """Checks the emoji pages: color_page_<n>.png, RGBA, numbered from 0 without gaps, all the same square size."""
     problems: list[str] = []
+    found = []
+    for p in atlas.glob("color_page_*.png"):
+        m = re.fullmatch(r"color_page_(\d+)\.png", p.name)
+        if not m:
+            problems.append(f"unexpected emoji page filename: {p.name}")
+            continue
+        found.append((int(m.group(1)), p))
+    found.sort()
+    ids = [i for i, _ in found]
+    if ids != list(range(len(ids))):
+        problems.append(f"emoji pages must be numbered without gaps from 0; found {ids[:12]}")
+    if len(found) != expected:
+        problems.append(f"the charset has emoji that need {expected} emoji page(s), but found {len(found)}")
+    size = None
+    for idx, p in found:
+        try:
+            with Image.open(p) as im:
+                if im.mode != "RGBA":
+                    problems.append(f"emoji page {idx} is {im.mode}; expected RGBA")
+                if im.width != im.height or im.width % 16:
+                    problems.append(f"emoji page {idx} is {im.size}; expected a square size divisible by 16")
+                if size is None:
+                    size = im.size
+                elif im.size != size:
+                    problems.append(f"emoji page {idx} size {im.size} differs from {size}")
+        except Exception as exc:
+            problems.append(f"cannot read {p.name}: {exc}")
+    return problems
+
+
+def check_atlas(atlas: Path, charset_hash: str, fmt: int, expected_pages: int, expected_color_pages: int = 0) -> list[str]:
+    """`expected_pages` counts the SDF pages only (page 0 plus the wide text pages); emoji pages are checked on their own."""
+    problems: list[str] = []
+    problems += check_color_pages(atlas, expected_color_pages) if (expected_color_pages or any(atlas.glob("color_page_*.png"))) else []
     if not atlas.is_dir():
         return [f"atlas directory does not exist: {atlas}"]
     pngs = []
@@ -87,8 +123,10 @@ def check_atlas(atlas: Path, charset_hash: str, fmt: int, expected_pages: int) -
             meta_fmt = int(meta.get("page_format", meta.get("format", 2)))
             if meta_fmt != fmt:
                 problems.append(f"atlas metadata format {meta_fmt} disagrees with charset format {fmt}")
-            if int(meta.get("pages", -1)) != expected_pages:
-                problems.append(f"atlas metadata pages={meta.get('pages')!r} disagrees with charset pages={expected_pages}")
+            if int(meta.get("pages", -1)) != expected_pages + expected_color_pages:
+                problems.append(f"atlas metadata pages={meta.get('pages')!r} disagrees with charset pages={expected_pages + expected_color_pages}")
+            if expected_color_pages and int(meta.get("color_page_start", -1)) != expected_pages:
+                problems.append(f"atlas metadata color_page_start={meta.get('color_page_start')!r}; the charset puts the emoji pages at page {expected_pages}")
             stored_hash = meta.get("charset_sha256")
             if stored_hash and str(stored_hash).lower() != charset_hash.lower():
                 problems.append("atlas metadata charset_sha256 does not match the supplied charset")
@@ -117,20 +155,22 @@ def check(charset, atlas, skip_protocol: bool = False) -> int:
         run_protocol_validation()
 
     try:
-        _, fmt, pages = load_charset(charset)
+        _, fmt, cs = load_charset(charset)
+        pages = cs.sdf_pages
         digest = sha256(charset)
     except Exception as exc:
         print(f"ERROR: charset validation failed: {exc}", file=sys.stderr)
         return 2
 
-    problems = check_atlas(atlas, digest, fmt, pages)
+    problems = check_atlas(atlas, digest, fmt, pages, cs.color_page_count)
     if problems:
         for problem in problems:
             print("ERROR:", problem, file=sys.stderr)
         return 1
 
-    print(f"OK: charset={charset.name} format={fmt} pages={pages} sha256={digest[:16]}…")
-    print(f"OK: atlas={atlas} pages={pages} metadata/hash match")
+    extra = f" + {cs.color_page_count} emoji page(s) from page {cs.color_first_page}" if cs.has_color else ""
+    print(f"OK: charset={charset.name} format={fmt} pages={pages}{extra} sha256={digest[:16]}…")
+    print(f"OK: atlas={atlas} pages={pages}{extra} metadata/hash match")
     return 0
 
 

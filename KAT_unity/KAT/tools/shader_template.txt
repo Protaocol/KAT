@@ -29,6 +29,10 @@ DATA LAYOUT (see kat_codec.py)
   page 0  : narrow glyphs, cells 1:2 (16 x 8 grid). Slot 254 = FOLLOW ("right half of the wide glyph in the previous slot")
   page 1+ : wide glyphs, square cells (16 x 16 grid) shown across two slots [lead][FOLLOW]
   _GlyphArray: Texture2DArray, slice = page, single channel SDF, 0.5 = glyph edge. Import as LINEAR (no sRGB).
+  _ColorArray (keyword KAT_COLOR_GLYPHS): optional Texture2DArray holding the emoji pages (RGBA, BC7, sRGB).
+                Every page from _ColorPageStart upwards is an emoji page, and its slice is page - _ColorPageStart. They use the
+                same 16 x 16 square cells as the wide pages, with [lead][FOLLOW] across two slots. Emoji ignore the text colour,
+                outline and weight; only the text colour's alpha reaches them.
   Character/page material properties are packed four scalars per constant register internally; _CharN/_PageN remain the public property names.
   Grow distance, amount, tail geometry and the extent-scan budget are exposed as material properties.
   ExtentScanSlots is a deliberate performance/accuracy tradeoff for shrink-to-fit box layout; glyph rendering still uses all slots.
@@ -59,6 +63,8 @@ Shader "Unlit/KF_VRChatAvatarTextShaderPaged"
 	{
 		[Enum(Off,0,Front,1,Back,2)] _Culling ("Culling Mode", Int) = 2
 		_GlyphArray ("Glyph SDF Array (one slice per page)", 2DArray) = "" {}
+		_ColorArray ("Emoji Array (BC7 or RGBA32, sRGB, one slice per emoji page; optional)", 2DArray) = "" {}
+		_ColorPageStart ("First emoji page (pages from here on come from the emoji array; 255 = none)", Range(1, 255)) = 255
 		_MainColor ("Main Colour", Color) = (1, 1, 1, 1)
 		_ShadowColor ("Outline / Shadow Colour", Color) = (0, 0, 0, 1)
 		_OutlineWidth ("Outline Width (SDF units)", Range(0, 0.3)) = 0.0
@@ -82,7 +88,8 @@ Shader "Unlit/KF_VRChatAvatarTextShaderPaged"
 		_Scale ("Text Scale", Range(0.2, 1)) = 1
 		_AnchorX ("Anchor X on the quad (0 = uv.x 0 end, 0.5 = centre, 1 = uv.x 1 end)", Range(0, 1)) = 0.5
 		_AnchorY ("Anchor Y (0 = top, 1 = bottom)", Range(0, 1)) = 0
-		[Toggle] _FaceViewer ("Face Viewer Billboard", Float) = 0
+		[Toggle] _FaceViewer ("Face Viewer Billboard (animated by KAT_HeadAnchor)", Float) = 0
+		[Enum(Auto,0,Always,1,Never,2)] _FaceViewerMode ("Face Viewer Override (Auto lets the head anchor decide)", Float) = 0
 		_Tail ("Speech Tail Size (0 = none, animated by KAT_HeadAnchor)", Range(0, 1)) = 0
 		_TailWidth ("Speech Tail Width (slot widths)", Range(0.2, 3)) = 1.6
 		_TailHeight ("Speech Tail Height (slot widths)", Range(0.2, 4)) = 2
@@ -130,10 +137,15 @@ Shader "Unlit/KF_VRChatAvatarTextShaderPaged"
 			#pragma multi_compile_fog
 			#pragma multi_compile_instancing
 			#pragma shader_feature_local _ KAT_PAGE_FORMAT_3
+			#pragma shader_feature_local _ KAT_COLOR_GLYPHS
 
 			#include "UnityCG.cginc"
 
 			UNITY_DECLARE_TEX2DARRAY(_GlyphArray);
+#ifdef KAT_COLOR_GLYPHS
+			UNITY_DECLARE_TEX2DARRAY(_ColorArray);
+#endif
+			float _ColorPageStart;
 
 			float4 _MainColor;
 			float4 _ShadowColor;
@@ -157,6 +169,7 @@ Shader "Unlit/KF_VRChatAvatarTextShaderPaged"
 			float _AnchorX;
 			float _AnchorY;
 			float _FaceViewer;
+			float _FaceViewerMode;
 			float _Tail;
 			float _TailWidth;
 			float _TailHeight;
@@ -288,8 +301,8 @@ Shader "Unlit/KF_VRChatAvatarTextShaderPaged"
 
 			float2 UsedExtent()
 			{
-				int rowLen = max((int)(_RowLength + 0.5), 1);
-				int rowCount = max((int)(_RowColumns + 0.5), 1);
+				uint rowLen = max((int)(_RowLength + 0.5), 1);
+				uint rowCount = max((int)(_RowColumns + 0.5), 1);
 				int total = min(rowLen * rowCount, min((int)(_ExtentScanSlots + 0.5), 128));
 				int lastCol = -1;
 				int lastRow = -1;
@@ -439,8 +452,11 @@ Shader "Unlit/KF_VRChatAvatarTextShaderPaged"
 
 
 				float3 worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
+				// _FaceViewerMode: 0 = Auto (the head anchor clips set _FaceViewer), 1 = Always, 2 = Never.
+				// Speech-bubble positions (_Tail > 0) never billboard, because the tail is built for the quad's real orientation.
+				float faceViewerBase = _FaceViewerMode > 1.5 ? 0.0 : (_FaceViewerMode > 0.5 ? 1.0 : saturate(_FaceViewer));
 				float faceViewerAmount =
-					saturate(_FaceViewer) * (1.0 - saturate(_Tail));
+					faceViewerBase * (1.0 - saturate(_Tail));
 
 				if (faceViewerAmount > 0.0001)
 				{
@@ -577,21 +593,43 @@ Shader "Unlit/KF_VRChatAvatarTextShaderPaged"
 					uvPerSlot = float2(0.5 / 16.0, 1.0 / 16.0);
 				}
 
+				// Emoji pages: anything from _ColorPageStart up is read from _ColorArray (slice = page - start) instead of the SDF array.
+				bool isColor = false;
+#ifdef KAT_COLOR_GLYPHS
+				uint colorStart = (uint)(_ColorPageStart + 0.5);
+				isColor = !blank && page != 0u && page >= colorStart;
+#endif
+
 				// Blank slots sample the empty space glyph (cell 0 of page 0) so derivatives stay well defined
 				float3 uvw = float3(uvDown.x, 1.0 - uvDown.y, (float)page);
-				if (blank) uvw = float3(0.001, 0.999, 0.0);
+				if (blank || isColor) uvw = float3(0.001, 0.999, 0.0);
 
 				float2 dX = gdx * float2(uvPerSlot.x, -uvPerSlot.y);
 				float2 dY = gdy * float2(uvPerSlot.x, -uvPerSlot.y);
 				float sd = _GlyphArray.SampleGrad(sampler_GlyphArray, uvw, dX, dY).r;
 				float aa = max(fwidth(sd), 1e-3);
-				if (blank) sd = 0.0;
+				if (blank || isColor) sd = 0.0;
+				float4 glyphColor = float4(0.0, 0.0, 0.0, 0.0);
+#ifdef KAT_COLOR_GLYPHS
+				[branch]
+				if (isColor)
+				{
+					float3 cuvw = float3(uvDown.x, 1.0 - uvDown.y, (float)(page - colorStart));
+					glyphColor = _ColorArray.SampleGrad(sampler_ColorArray, cuvw, dX, dY);
+				}
+#endif
 
 				float fill = saturate((sd - (0.5 - _Weight)) / aa + 0.5);
 				float outer = saturate((sd - (0.5 - _Weight - _OutlineWidth)) / aa + 0.5);
 
 				float3 textRgb = lerp(_ShadowColor.rgb, _MainColor.rgb, fill / max(outer, 1e-4));
 				float textA = outer * _MainColor.a;
+				if (isColor)
+				{
+					// Emoji keep their own colours, and only the text colour's alpha applies. The alpha is straight, same as the SDF path.
+					textRgb = glyphColor.rgb;
+					textA = glyphColor.a * _MainColor.a;
+				}
 
 				// Box: rounded rectangle, negative distance inside. Backdrop inside, border in the outer strip.
 				float2 boxHalf = boxSize * 0.5;

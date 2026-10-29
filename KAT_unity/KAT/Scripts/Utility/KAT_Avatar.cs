@@ -58,6 +58,15 @@ namespace KillFrenzy.AvatarTextTools.Utility
 				ExpressionParameters expressionParameters = avatarDescriptor.expressionParameters;
 				ExpressionsMenu expressionsMenu = avatarDescriptor.expressionsMenu;
 
+				if (settings.InstallBoardControls) {
+					string boardProblem;
+					if (!KatBoard.CanInstall(avatarDescriptor.gameObject.transform, out boardProblem)) {
+						Debug.LogError("KAT install stopped: " + boardProblem);
+						EditorUtility.DisplayDialog("KAT install stopped", boardProblem, "OK");
+						return false;
+					}
+				}
+
 				foreach (VRCAvatarDescriptor.CustomAnimLayer animLayer in avatarDescriptor.baseAnimationLayers) {
 					if (animLayer.type == VRCAvatarDescriptor.AnimLayerType.FX) {
 						if (animLayer.animatorController != null) {
@@ -142,7 +151,7 @@ namespace KillFrenzy.AvatarTextTools.Utility
 				string headScalePivotPath;
 				if (
 					KatObjectsInstaller.InstallObjectsToAvatar(avatarDescriptor.gameObject.transform, settings, out headScalePivotPath) &&
-					KatAnimatorInstaller.InstallToAnimator(animatorController, settings, headScalePivotPath) &&
+					KatAnimatorInstaller.InstallToAnimator(animatorController, settings, headScalePivotPath, avatarDescriptor.gameObject.transform) &&
 					KatMenuInstaller.InstallToMenu(expressionsMenu, settings) &&
 					KatParametersInstaller.InstallToParameters(expressionParameters, settings) &&
 					KatObjectsInstaller.InstallPagedMenuToAvatar(avatarDescriptor, settings)

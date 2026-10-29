@@ -11,6 +11,12 @@ GLYPH MODEL (both formats)
                 format 2: pages 1..14  -> up to 14 * 255  = 3570  wide glyphs   (default)
                 format 3: pages 1..253 -> up to 253 * 255 = 64515 wide glyphs   (opt-in)
 
+  EMOJI pages (optional)  the pages right after the last wide text page. Same square cells and the same [lead][FOLLOW] pair of
+                slots as a wide glyph, but the pixels are RGBA instead of an SDF (atlas/color_page_XX.png, which Unity turns into
+                its own BC7 array). They use up page numbers like any other page, so in format 2 the wide text pages plus the
+                emoji pages have to fit in 14. charset.json describes them with "color", "emoji_aliases" and "color_sources".
+                The client swaps ":sob:" and multi-code-point emoji for a single glyph before it lays text out (expand_emoji).
+
   Slot 0 of page 0 must be a space: an animator slot that was never written reads 0 -> blank.
 
 WIRE (one pointer write = M chars, M even)
@@ -32,6 +38,8 @@ SYMBOLS
 import json
 import math
 import unicodedata
+
+from kat_emoji import ALIAS_RE, SEQUENCE_BASE, VS16
 
 from kat_protocol import (          # noqa: F401  (re-exported: existing code imports these from kat_codec)
     FOLLOW,
@@ -168,7 +176,9 @@ def decode_group(char_floats: list[float], page_floats: list[float], page_format
 
 
 class Charset:
-    def __init__(self, narrow: str, wide: str, fallback: str = "?", page_format: int = PAGE_FORMAT_DEFAULT):
+    def __init__(self, narrow: str, wide: str, fallback: str = "?", page_format: int = PAGE_FORMAT_DEFAULT,
+                 color: list[str] | None = None, emoji_aliases: dict[str, str] | None = None,
+                 color_sources: dict[str, str] | None = None, emoji_synonyms: dict[str, str] | None = None):
         check_format(page_format)
         self.page_format = page_format
         if not narrow or narrow[0] != " ":
@@ -187,6 +197,124 @@ class Charset:
         self._index.update({c: WIDE_START + j for j, c in enumerate(wide)})
         self._cache: dict[str, int] = {}
         self.fallback_index = self._index.get(fallback, BLANK)
+        self._init_color(list(color or []), dict(emoji_aliases or {}), dict(color_sources or {}), dict(emoji_synonyms or {}))
+
+    # ------------------------------------------------------------------ emoji
+
+    def _init_color(self, color: list[str], aliases: dict[str, str], sources: dict[str, str],
+                    synonyms: dict[str, str] | None = None) -> None:
+        text_pages = math.ceil(len(self.wide) / SLOTS_PER_PAGE)
+        color_pages = math.ceil(len(color) / SLOTS_PER_PAGE)
+        if text_pages + color_pages > wide_pages(self.page_format):
+            raise ValueError(
+                f"format {self.page_format}: {len(self.wide)} wide glyphs need {text_pages} page(s) and {len(color)} emoji "
+                f"need {color_pages}, but there are only {wide_pages(self.page_format)} wide pages. Emoji pages use up page "
+                "numbers too: use fewer wide glyphs, or switch to page format 3.")
+        if any(not isinstance(k, str) or not k for k in color):
+            raise ValueError("emoji keys must be non-empty strings")
+        if len(set(color)) != len(color):
+            raise ValueError("the same emoji is listed twice in the charset")
+        clash = [k for k in color if k in self._index]
+        if clash:
+            raise ValueError(f"{''.join(clash[:10])!r} is both an emoji and a normal text glyph in this charset")
+        for k in sources:
+            if k not in color:
+                raise ValueError(f"color_sources has an entry for {k!r}, which isn't one of the emoji")
+        self.color = color
+        self.color_sources = sources
+        self.color_first_page = 1 + text_pages
+        self.color_page_count = color_pages
+        base = self.color_first_page * SLOTS_PER_PAGE
+        # An emoji made of several code points can't be one Python character, so the client swaps each one for a stand-in
+        # character before laying text out. Those stand-ins only exist at runtime; they never go in charset.json.
+        self._seq_map: dict[str, str] = {}
+        for j, key in enumerate(color):
+            if len(key) == 1:
+                self._index[key] = base + j
+            else:
+                ph = chr(SEQUENCE_BASE + j)
+                self._seq_map[key] = ph
+                self._index[ph] = base + j
+                self._index[key] = base + j        # so index_of() also works with the whole sequence
+        self._seq_lens = sorted({len(k) for k in self._seq_map}, reverse=True)
+        self.emoji_aliases: dict[str, str] = {}
+        for name, key in aliases.items():
+            if not ALIAS_RE.fullmatch(name):
+                raise ValueError(f"{name!r} isn't a valid shortcode (use 1-32 of a-z 0-9 _ -, lower case)")
+            if key not in color:
+                raise ValueError(f":{name}: points at {key!r}, which isn't one of the emoji")
+            self.emoji_aliases[name] = key
+        self._max_alias = max((len(n) for n in self.emoji_aliases), default=0)
+        # An emoji synonym is another emoji that means an existing glyph (two identical pictures in --emoji-dir). It is swapped for
+        # that glyph's character when text is laid out, exactly like a multi-code-point emoji is.
+        self.emoji_synonyms: dict[str, str] = {}
+        self._syn_single: dict[str, str] = {}
+        for syn, key in (synonyms or {}).items():
+            if not syn or not isinstance(syn, str) or syn[0].isascii():
+                raise ValueError(f"emoji synonym {syn!r} must be an emoji")
+            if key not in color:
+                raise ValueError(f"emoji synonym {syn!r} points at {key!r}, which isn't one of the emoji")
+            if syn in color or syn in self._index:
+                raise ValueError(f"emoji synonym {syn!r} is already a glyph of its own")
+            self.emoji_synonyms[syn] = key
+            ph = self._glyph_char(key)
+            if len(syn) == 1:
+                self._syn_single[syn] = ph
+            else:
+                self._seq_map[syn] = ph
+            self._index[syn] = self._index[ph]
+        self._seq_lens = sorted({len(k) for k in self._seq_map}, reverse=True)
+        self.has_color = bool(color)
+
+    def _glyph_char(self, key: str) -> str:
+        """The one character the layout code uses for this emoji."""
+        return key if len(key) == 1 else self._seq_map[key]
+
+    def expand_emoji(self, text: str) -> str:
+        """Swaps ``:shortcode:`` and multi-code-point emoji for one character each, so layout can keep treating every glyph as
+        a single character. Shortcodes we don't know are left alone, and a variation selector right after an emoji is dropped.
+        This is only for laying out and measuring; the text the person is editing never changes."""
+        if not self.has_color:
+            return text
+        out: list[str] = []
+        i, n = 0, len(text)
+        color_single = {k for k in self.color if len(k) == 1}
+        while i < n:
+            c = text[i]
+            if c == ":" and self._max_alias:
+                j = text.find(":", i + 1, i + 2 + self._max_alias)
+                if j > i + 1:
+                    key = self.emoji_aliases.get(text[i + 1:j].lower())
+                    if key is not None:
+                        out.append(self._glyph_char(key))
+                        i = j + 1
+                        continue
+            if c in self._syn_single:
+                out.append(self._syn_single[c])
+                i += 1
+                if i < n and text[i] == VS16:
+                    i += 1
+                continue
+            if self._seq_lens and ord(c) > 0x7F:
+                hit = None
+                for length in self._seq_lens:           # longest match first
+                    ph = self._seq_map.get(text[i:i + length])
+                    if ph is not None:
+                        hit = (ph, length)
+                        break
+                if hit:
+                    out.append(hit[0])
+                    i += hit[1]
+                    continue
+            out.append(c)
+            i += 1
+            if c in color_single and i < n and text[i] == VS16:
+                i += 1
+        return "".join(out)
+
+    def is_color(self, glyph_index: int) -> bool:
+        lo = self.color_first_page * SLOTS_PER_PAGE
+        return self.has_color and lo <= glyph_index < lo + len(self.color)
 
     @classmethod
     def load(cls, path: str, fallback: str = "?", page_format: int | None = None) -> "Charset":
@@ -197,21 +325,37 @@ class Charset:
         fmt = read_charset_format(d)
         if page_format is not None and page_format != fmt:
             raise PageFormatError(f"{path} is a format-{fmt} charset but format {page_format} was requested")
-        return cls(d["narrow"], d["wide"], fallback, page_format=fmt)
+        return cls(d["narrow"], d["wide"], fallback, page_format=fmt, color=d.get("color"),
+                   emoji_aliases=d.get("emoji_aliases"), color_sources=d.get("color_sources"),
+                   emoji_synonyms=d.get("emoji_synonyms"))
 
     def to_json_dict(self) -> dict:
         """Return the canonical charset JSON representation with an explicit page format."""
-        return {
+        d = {
             "format": self.page_format,
             "page_format": self.page_format,
             "narrow": self.narrow,
             "wide": self.wide,
             "pages": self.pages,
         }
+        if self.has_color:                      # only written when there are emoji, so normal charsets look exactly as before
+            d["color"] = self.color
+            d["emoji_aliases"] = self.emoji_aliases
+            if self.emoji_synonyms:
+                d["emoji_synonyms"] = self.emoji_synonyms
+            if self.color_sources:
+                d["color_sources"] = self.color_sources
+        return d
+
+    @property
+    def sdf_pages(self) -> int:
+        """How many pages are SDF: page 0 plus the wide text pages."""
+        return 1 + math.ceil(len(self.wide) / SLOTS_PER_PAGE)
 
     @property
     def pages(self) -> int:
-        return 1 + math.ceil(len(self.wide) / SLOTS_PER_PAGE)
+        """Every page number in use: the SDF pages, then the emoji pages."""
+        return self.sdf_pages + self.color_page_count
 
     @staticmethod
     def is_wide(glyph_index: int) -> bool:
@@ -244,4 +388,7 @@ class Charset:
         j = glyph_index - WIDE_START
         if 0 <= j < len(self.wide):
             return self.wide[j]
+        k = glyph_index - self.color_first_page * SLOTS_PER_PAGE
+        if self.has_color and 0 <= k < len(self.color):
+            return self.color[k]
         return ""      # FOLLOW marker or unassigned cell

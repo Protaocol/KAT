@@ -10,8 +10,11 @@ Adds:
   - KatPagedBuilder: menu tool that turns the PNG pages from build_atlas.py into a Texture2DArray
                      and creates the KAT_Text_Paged material that uses the paged shader.
   - Anchor clips   : chest / left-head / right-head / top-head anchor clips for the KAT_HeadAnchor radial layer
-  - KatPagedMenu   : menu tool that adds the "KAT Text" submenu (Anchor radial, Text Style radial, Roll Speed radial) to an avatar's
-                     expression menu and makes sure the required parameters exist.
+  - KatPagedMenu   : menu tool that adds the "KAT Text" submenu (Anchor radial, Text Style radial, Roll Speed radial, and optionally an
+                     "Advanced" submenu of material tweaks) to an avatar's expression menu and makes sure the required parameters exist.
+  - Emoji pages    : color_page_*.png from build_atlas.py (emoji and emoji images) become a second Texture2DArray, KAT_ColorArray, compressed
+                     to BC7 (or RGBA32 if the editor refuses) and hooked up to the shader through _ColorArray, _ColorPageStart and the
+                     KAT_COLOR_GLYPHS keyword.
 */
 
 #if UNITY_EDITOR
@@ -72,6 +75,60 @@ namespace KillFrenzy.AvatarTextTools.Utility
 			SetCurve(clip, EditorCurveBinding.FloatCurve(TextPath, typeof(MeshRenderer), "material._TailSide"), tailSide);
 			SetCurve(clip, EditorCurveBinding.FloatCurve(TextPath, typeof(MeshRenderer), "material._AnchorY"), anchorY);
 			SetCurve(clip, EditorCurveBinding.FloatCurve(TextPath, typeof(MeshRenderer), "material._FaceViewer"), billboard);
+			EditorUtility.SetDirty(clip);
+			AssetDatabase.SaveAssets();
+			return clip;
+		}
+
+		// Clips for the advanced menu. Each sets exactly one value on the text, so a layer built from them doesn't depend on any other
+		// KAT layer, and it behaves the same with write defaults on or off.
+		public static KatAdvancedClips GetAdvancedClips(KatSettings settings)
+		{
+			KatAdvancedClips c = new KatAdvancedClips();
+			c.billboardAuto = GetValueClip(settings, "AdvBillboardAuto", "_FaceViewerMode", 0f);
+			c.billboardAlways = GetValueClip(settings, "AdvBillboardAlways", "_FaceViewerMode", 1f);
+			c.billboardNever = GetValueClip(settings, "AdvBillboardNever", "_FaceViewerMode", 2f);
+			c.growOn = GetValueClip(settings, "AdvGrowOn", "_GrowEnabled", 1f);
+			c.growOff = GetValueClip(settings, "AdvGrowOff", "_GrowEnabled", 0f);
+			c.boxOn = GetValueClip(settings, "AdvBoxOn", "_BoxEnabled", 1f);
+			c.boxOff = GetValueClip(settings, "AdvBoxOff", "_BoxEnabled", 0f);
+			c.shrinkOn = GetValueClip(settings, "AdvShrinkOn", "_ShrinkToFit", 1f);
+			c.shrinkOff = GetValueClip(settings, "AdvShrinkOff", "_ShrinkToFit", 0f);
+			c.boldOn = GetValueClip(settings, "AdvBoldOn", "_Weight", 0.05f);
+			c.boldOff = GetValueClip(settings, "AdvBoldOff", "_Weight", 0f);
+			// Board size scales the Constraint object (Text's parent), not the Text quad. The installer gives the quad a lopsided scale
+			// (0.5 x 1/6), and a uniform scale clip would flatten that into a square.
+			c.sizeSmall = GetHeadScaleClip("AdvSizeSmall", KatSettings.AdvSizeMin, ConstraintPath);
+			c.sizeDefault = GetHeadScaleClip("AdvSizeDefault", KatSettings.AdvSizeDefault, ConstraintPath);
+			c.sizeLarge = GetHeadScaleClip("AdvSizeLarge", KatSettings.AdvSizeMax, ConstraintPath);
+			return c;
+		}
+
+		// Gives back an empty clip asset in the clips folder (an existing one is wiped and reused).
+		public static AnimationClip LoadOrCreateClip(KatSettings settings, string name)
+		{
+			string path = ClipPath(settings, name);
+			AnimationClip clip = AssetDatabase.LoadAssetAtPath<AnimationClip>(path);
+			if (clip == null) {
+				clip = new AnimationClip();
+				clip.name = name;
+				AssetDatabase.CreateAsset(clip, path);
+			} else {
+				clip.ClearCurves();
+			}
+			return clip;
+		}
+
+		private static AnimationClip GetValueClip(KatSettings settings, string name, string materialProperty, float value)
+		{
+			string path = ClipPath(settings, name);
+			AnimationClip clip = AssetDatabase.LoadAssetAtPath<AnimationClip>(path);
+			if (clip == null) {
+				clip = new AnimationClip();
+				clip.name = name;
+				AssetDatabase.CreateAsset(clip, path);
+			}
+			SetCurve(clip, EditorCurveBinding.FloatCurve(TextPath, typeof(MeshRenderer), "material." + materialProperty), value);
 			EditorUtility.SetDirty(clip);
 			AssetDatabase.SaveAssets();
 			return clip;
@@ -220,6 +277,147 @@ namespace KillFrenzy.AvatarTextTools.Utility
 		}
 	}
 
+	// Makes the mipmaps with a Kaiser filter. When you build a texture from script, Unity always makes box-filtered mips, and the
+	// importer's Kaiser option only applies to textures it imports itself, so for these arrays we do it by hand: each mip level is
+	// a 2x downsample with a Kaiser-windowed sinc (6 taps, horizontal then vertical), and the texture is applied with
+	// Apply(false) so Unity doesn't redo them. Emoji pages are filtered premultiplied, so their transparent pixels can't leak
+	// dark edges into the smaller mips.
+	internal static class KatMips
+	{
+		public static bool UseKaiser = true;   // set to false to go back to Unity's own box mips
+		private const float Beta = 4f;
+		private static readonly float[] Weights = BuildWeights();
+
+		private static float Bessel0(float x)
+		{
+			float sum = 1f, term = 1f;
+			for (int k = 1; k < 30; k++) {
+				float h = x / (2f * k);
+				term *= h * h;
+				sum += term;
+			}
+			return sum;
+		}
+
+		private static float Sinc(float x)
+		{
+			if (Mathf.Abs(x) < 1e-6f) return 1f;
+			float px = Mathf.PI * x;
+			return Mathf.Sin(px) / px;
+		}
+
+		// Each output pixel sits between input pixels 2x and 2x+1, so the six taps are at -2.5 ... +2.5 pixels from it.
+		private static float[] BuildWeights()
+		{
+			float[] w = new float[6];
+			float sum = 0f;
+			for (int i = 0; i < 6; i++) {
+				float d = i - 2.5f;
+				float t = d / 3f;
+				float window = Bessel0(Beta * Mathf.Sqrt(Mathf.Max(0f, 1f - t * t))) / Bessel0(Beta);
+				w[i] = Sinc(d * 0.5f) * window;
+				sum += w[i];
+			}
+			for (int i = 0; i < 6; i++) w[i] /= sum;
+			return w;
+		}
+
+		private static float[] Down(float[] src, int w, int h)
+		{
+			int nw = Mathf.Max(1, w / 2), nh = Mathf.Max(1, h / 2);
+			float[] tmp = new float[nw * h * 4];
+			for (int y = 0; y < h; y++) {
+				for (int x = 0; x < nw; x++) {
+					for (int c = 0; c < 4; c++) {
+						float acc = 0f;
+						for (int i = 0; i < 6; i++) {
+							int sx = Mathf.Clamp(2 * x - 2 + i, 0, w - 1);
+							acc += Weights[i] * src[(y * w + sx) * 4 + c];
+						}
+						tmp[(y * nw + x) * 4 + c] = acc;
+					}
+				}
+			}
+			float[] dst = new float[nw * nh * 4];
+			for (int y = 0; y < nh; y++) {
+				for (int x = 0; x < nw; x++) {
+					for (int c = 0; c < 4; c++) {
+						float acc = 0f;
+						for (int i = 0; i < 6; i++) {
+							int sy = Mathf.Clamp(2 * y - 2 + i, 0, h - 1);
+							acc += Weights[i] * tmp[(sy * nw + x) * 4 + c];
+						}
+						dst[(y * nw + x) * 4 + c] = acc;
+					}
+				}
+			}
+			return dst;
+		}
+
+		private static byte ToByte(float v)
+		{
+			return (byte)Mathf.Clamp(Mathf.RoundToInt(v), 0, 255);
+		}
+
+		// Takes level 0 (size x size) and builds every mip down to 1x1. singleChannel: only .r counts (SDF pages). premultiply: for RGBA emoji pages.
+		public static Color32[][] Chain(Color32[] level0, int size, bool singleChannel, bool premultiply)
+		{
+			int levels = 1;
+			for (int n = size; n > 1; n /= 2) levels++;
+			Color32[][] chain = new Color32[levels][];
+			chain[0] = level0;
+
+			float[] cur = new float[size * size * 4];
+			for (int i = 0; i < level0.Length; i++) {
+				Color32 c = level0[i];
+				float a = singleChannel ? 255f : c.a;
+				float k = premultiply ? a / 255f : 1f;
+				cur[i * 4 + 0] = c.r * k;
+				cur[i * 4 + 1] = singleChannel ? 0f : c.g * k;
+				cur[i * 4 + 2] = singleChannel ? 0f : c.b * k;
+				cur[i * 4 + 3] = a;
+			}
+
+			int w = size;
+			for (int level = 1; level < levels; level++) {
+				cur = Down(cur, w, w);
+				w = Mathf.Max(1, w / 2);
+				Color32[] px = new Color32[w * w];
+				for (int i = 0; i < px.Length; i++) {
+					float a = Mathf.Clamp(cur[i * 4 + 3], 0f, 255f);
+					float inv = premultiply ? (a > 0.5f ? 255f / a : 0f) : 1f;
+					px[i] = new Color32(
+						ToByte(cur[i * 4 + 0] * inv),
+						singleChannel ? (byte)0 : ToByte(cur[i * 4 + 1] * inv),
+						singleChannel ? (byte)0 : ToByte(cur[i * 4 + 2] * inv),
+						singleChannel ? (byte)255 : ToByte(a));
+				}
+				chain[level] = px;
+			}
+			return chain;
+		}
+
+		// Fills a texture (made with a mip chain) with the Kaiser mips.
+		public static void Fill(Texture2D target, Color32[] level0, int size, bool singleChannel, bool premultiply)
+		{
+			Color32[][] chain = Chain(level0, size, singleChannel, premultiply);
+			for (int level = 0; level < chain.Length && level < target.mipmapCount; level++) {
+				target.SetPixels32(chain[level], level);
+			}
+			target.Apply(false, false);
+		}
+	}
+
+	public class KatAdvancedClips
+	{
+		public AnimationClip billboardAuto, billboardAlways, billboardNever;
+		public AnimationClip growOn, growOff;
+		public AnimationClip boxOn, boxOff;
+		public AnimationClip shrinkOn, shrinkOff;
+		public AnimationClip boldOn, boldOff;
+		public AnimationClip sizeSmall, sizeDefault, sizeLarge;
+	}
+
 	public static class KatPagedBuilder
 	{
 		private const string ShaderName = "Unlit/KF_VRChatAvatarTextShaderPaged";
@@ -228,6 +426,10 @@ namespace KillFrenzy.AvatarTextTools.Utility
 		// Remembers the last *external* folder (e.g. wherever build_atlas.py -o wrote to), purely so that if the
 		// person does need to browse again (new charset export, etc.) the dialog opens where they left off.
 		private const string LastExternalFolderPrefKey = "KAT_Paged_LastSourceFolder";
+		// The emoji pages build_atlas.py writes: RGBA PNGs, one slice of the emoji array each.
+		private const string ColorPagePattern = "color_page_*.png";
+		private const string ColorArrayAssetName = "KAT_ColorArray.asset";
+		public const string ColorGlyphsKeyword = "KAT_COLOR_GLYPHS";
 
 		[MenuItem("Tools/KAT/KAT Paged/Build Glyph Array + Material (R8)")]
 		public static void BuildR8() { BuildFromDialog(false); }
@@ -289,6 +491,10 @@ namespace KillFrenzy.AvatarTextTools.Utility
 			{
 				File.Copy(src, Path.Combine(destAbsolute, Path.GetFileName(src)), true);
 			}
+			foreach (string src in Directory.GetFiles(folder, ColorPagePattern))
+			{
+				File.Copy(src, Path.Combine(destAbsolute, Path.GetFileName(src)), true);
+			}
 
 			string meta = Path.Combine(folder, "atlas_meta.json");
 			if (File.Exists(meta))
@@ -311,7 +517,18 @@ namespace KillFrenzy.AvatarTextTools.Utility
 				Debug.LogError("KAT Paged: no page_*.png in " + folder);
 				return;
 			}
-			if (!CheckPageCount(files.Length, ReadMetaPageFormat(folder))) return;
+			string[] colorFiles = Directory.GetFiles(folder, ColorPagePattern);
+			Array.Sort(colorFiles, ComparePageFiles);
+			// As far as the wire format goes, emoji pages are ordinary pages: they get the page numbers right after the SDF pages.
+			if (!CheckPageCount(files.Length + colorFiles.Length, ReadMetaPageFormat(folder))) return;
+			int metaColorStart = ReadMetaColorPageStart(folder);
+			if (colorFiles.Length > 0 && metaColorStart != 0 && metaColorStart != files.Length) {
+				string problem = "atlas_meta.json says the emoji pages start at page " + metaColorStart + ", but there are " + files.Length +
+					" SDF pages (page_*.png), so the emoji would be looked up in the wrong place. Rebuild the atlas with build_atlas.py and import it again.";
+				Debug.LogError("KAT Paged: " + problem);
+				EditorUtility.DisplayDialog("KAT Paged", problem, "OK");
+				return;
+			}
 
 			Texture2D[] pages = new Texture2D[files.Length];
 			for (int p = 0; p < files.Length; p++) {
@@ -339,6 +556,29 @@ namespace KillFrenzy.AvatarTextTools.Utility
 			Texture2DArray array = bc4 ? BuildBC4Array(pages, size) : null;
 			if (array == null) array = BuildR8Array(pages, size);
 
+			// The emoji array, if there is one (BC7, or plain RGBA32 if that fails)
+			Texture2DArray colorArray = null;
+			Texture2D[] colorPages = null;
+			if (colorFiles.Length > 0) {
+				colorPages = new Texture2D[colorFiles.Length];
+				for (int c = 0; c < colorFiles.Length; c++) {
+					colorPages[c] = new Texture2D(2, 2, TextureFormat.RGBA32, false, false);
+					colorPages[c].LoadImage(File.ReadAllBytes(colorFiles[c]), false);
+				}
+				int colorSize = colorPages[0].width;
+				bool sizesOk = colorPages[0].height == colorSize;
+				for (int c = 1; c < colorPages.Length && sizesOk; c++) sizesOk = colorPages[c].width == colorSize && colorPages[c].height == colorSize;
+				if (!sizesOk) {
+					Debug.LogError("KAT Paged: all the emoji pages (" + ColorPagePattern + ") have to be the same square size.");
+					DestroyPages(colorPages);
+					DestroyPages(pages);
+					UnityEngine.Object.DestroyImmediate(array);
+					return;
+				}
+				colorArray = BuildBC7Array(colorPages, colorSize);
+				if (colorArray == null) colorArray = BuildRgba32Array(colorPages, colorSize);
+			}
+
 			string arrayPath = outDir + "/KAT_GlyphArray.asset";
 			if (AssetDatabase.LoadAssetAtPath<Texture2DArray>(arrayPath) != null) AssetDatabase.DeleteAsset(arrayPath);
 			AssetDatabase.CreateAsset(array, arrayPath);
@@ -360,6 +600,20 @@ namespace KillFrenzy.AvatarTextTools.Utility
 				material.shader = shader;
 			}
 			material.SetTexture("_GlyphArray", AssetDatabase.LoadAssetAtPath<Texture2DArray>(arrayPath));
+
+			string colorPath = outDir + "/" + ColorArrayAssetName;
+			if (AssetDatabase.LoadAssetAtPath<Texture2DArray>(colorPath) != null) AssetDatabase.DeleteAsset(colorPath);
+			if (colorArray != null) {
+				AssetDatabase.CreateAsset(colorArray, colorPath);
+				material.SetTexture("_ColorArray", AssetDatabase.LoadAssetAtPath<Texture2DArray>(colorPath));
+				material.SetFloat("_ColorPageStart", files.Length);
+				material.EnableKeyword(ColorGlyphsKeyword);
+			} else {
+				// No emoji in this atlas: make sure nothing left over from an earlier build stays on the material.
+				if (material.HasProperty("_ColorArray")) material.SetTexture("_ColorArray", null);
+				material.SetFloat("_ColorPageStart", 255f);
+				material.DisableKeyword(ColorGlyphsKeyword);
+			}
 			if (material.HasProperty("_OutlineWidth") && Mathf.Approximately(material.GetFloat("_OutlineWidth"), 0.12f)) {
 				material.SetFloat("_OutlineWidth", 0.0f);
 			}
@@ -370,13 +624,38 @@ namespace KillFrenzy.AvatarTextTools.Utility
 
 			EditorUtility.SetDirty(material);
 			AssetDatabase.SaveAssets();
+			KatKeyboardPaging.SyncMaterial(material);   // the in-game keyboard draws its key legends out of this atlas
 
 			DestroyPages(pages);
-			Debug.Log("KAT Paged: " + files.Length + " pages of " + size + "x" + size + " -> " + arrayPath + " (" + array.format + ") and " + matPath);
+			if (colorPages != null) DestroyPages(colorPages);
+			Debug.Log("KAT Paged: " + files.Length + " pages of " + size + "x" + size + " -> " + arrayPath + " (" + array.format + ") and " + matPath +
+				(colorArray != null ? "; " + colorFiles.Length + " emoji pages -> " + colorPath + " (" + colorArray.format + "), emoji pages start at page " + files.Length : ""));
 		}
 
 		[Serializable]
-		private class AtlasMeta { public int page_format; public int format; }
+		private class AtlasMeta { public int page_format; public int format; public int color_page_start; public int color_pages; }
+
+		// The first emoji page number that build_atlas.py wrote down (0 if it didn't, or there are no emoji).
+		private static int ReadMetaColorPageStart(string folder)
+		{
+			string meta = Path.Combine(folder, "atlas_meta.json");
+			if (!File.Exists(meta)) return 0;
+			try {
+				AtlasMeta parsed = JsonUtility.FromJson<AtlasMeta>(File.ReadAllText(meta));
+				return parsed == null ? 0 : parsed.color_page_start;
+			} catch (Exception) {
+				return 0;
+			}
+		}
+
+		// How many emoji pages the imported atlas has (the array's depth), or 0.
+		private static int ColorPageCountInProject()
+		{
+			string[] guids = AssetDatabase.FindAssets("KAT_ColorArray t:Texture2DArray");
+			if (guids.Length == 0) return 0;
+			Texture2DArray array = AssetDatabase.LoadAssetAtPath<Texture2DArray>(AssetDatabase.GUIDToAssetPath(guids[0]));
+			return array != null ? array.depth : 0;
+		}
 
 		private static void DestroyPages(Texture2D[] pages)
 		{
@@ -403,7 +682,9 @@ namespace KillFrenzy.AvatarTextTools.Utility
 		{
 			string name = Path.GetFileNameWithoutExtension(file);
 			int number;
-			return int.TryParse(name.Substring("page_".Length), out number) ? number : int.MaxValue;
+			// "page_07" and "color_page_07" both sort by the number
+			int at = name.LastIndexOf("page_", StringComparison.Ordinal);
+			return at >= 0 && int.TryParse(name.Substring(at + "page_".Length), out number) ? number : int.MaxValue;
 		}
 
 		private static int ComparePageFiles(string a, string b)
@@ -442,6 +723,7 @@ namespace KillFrenzy.AvatarTextTools.Utility
 				Texture2DArray array = AssetDatabase.LoadAssetAtPath<Texture2DArray>(AssetDatabase.GUIDToAssetPath(guids[0]));
 				if (array != null) pages = array.depth;
 			}
+			pages += ColorPageCountInProject();
 			int fromMeta = ReadMetaPageFormat(ImportedPagesFolder());
 			if (fromMeta != 0) return fromMeta;
 			return pages > KatSettings.MaxPage2 + 1 ? KatSettings.PageFormat3 : 0;
@@ -455,6 +737,7 @@ namespace KillFrenzy.AvatarTextTools.Utility
 					"Run Tools > KillFrenzy > KAT Paged > Build Glyph Array + Material first for the paged text.");
 				return true;
 			}
+			if (settings.InstallKeyboard) KatKeyboardPaging.SyncMaterial(textMaterial);   // an atlas built before the keyboard got live legends still works
 			return ValidateAtlasForSettings(settings, textMaterial);
 		}
 
@@ -463,7 +746,8 @@ namespace KillFrenzy.AvatarTextTools.Utility
 			Texture2DArray atlas = textMaterial != null && textMaterial.HasProperty("_GlyphArray") ? textMaterial.GetTexture("_GlyphArray") as Texture2DArray : null;
 			if (atlas == null) return true; // not a paged material; nothing to check
 
-			int depth = atlas.depth;
+			Texture2DArray colorAtlas = textMaterial.HasProperty("_ColorArray") ? textMaterial.GetTexture("_ColorArray") as Texture2DArray : null;
+			int depth = atlas.depth + (colorAtlas != null ? colorAtlas.depth : 0); // emoji pages use up page numbers too
 			int metaFormat = ReadMetaPageFormat(ImportedPagesFolder());
 			string problem = null;
 			if (depth > settings.GetMaxPage() + 1) {
@@ -488,9 +772,14 @@ namespace KillFrenzy.AvatarTextTools.Utility
 			array.wrapMode = TextureWrapMode.Clamp;
 			array.filterMode = FilterMode.Bilinear;
 			for (int p = 0; p < pages.Length; p++) {
-				array.SetPixels32(pages[p].GetPixels32(), p, 0);
+				if (KatMips.UseKaiser) {
+					Color32[][] chain = KatMips.Chain(pages[p].GetPixels32(), size, true, false);
+					for (int level = 0; level < chain.Length; level++) array.SetPixels32(chain[level], p, level);
+				} else {
+					array.SetPixels32(pages[p].GetPixels32(), p, 0);
+				}
 			}
-			array.Apply(true, false);
+			array.Apply(!KatMips.UseKaiser, false);
 			return array;
 		}
 
@@ -504,8 +793,12 @@ namespace KillFrenzy.AvatarTextTools.Utility
 				array.filterMode = FilterMode.Bilinear;
 				for (int p = 0; p < pages.Length; p++) {
 					Texture2D src = new Texture2D(size, size, TextureFormat.R8, true, true);
-					src.SetPixels32(pages[p].GetPixels32(), 0);
-					src.Apply(true, false);
+					if (KatMips.UseKaiser) {
+						KatMips.Fill(src, pages[p].GetPixels32(), size, true, false);
+					} else {
+						src.SetPixels32(pages[p].GetPixels32(), 0);
+						src.Apply(true, false);
+					}
 					EditorUtility.CompressTexture(src, TextureFormat.BC4, TextureCompressionQuality.Best);
 					for (int mip = 0; mip < src.mipmapCount; mip++) {
 						Graphics.CopyTexture(src, 0, mip, array, p, mip);
@@ -517,6 +810,52 @@ namespace KillFrenzy.AvatarTextTools.Utility
 				Debug.LogWarning("KAT Paged: BC4 array failed (" + e.Message + "), falling back to R8.");
 				return null;
 			}
+		}
+
+		// Packs the emoji pages as BC7 (RGBA, 1 byte per pixel, sRGB). Returns null if this Unity or platform won't do it, so the
+		// caller can fall back to uncompressed RGBA32.
+		private static Texture2DArray BuildBC7Array(Texture2D[] pages, int size)
+		{
+			try {
+				Texture2DArray array = new Texture2DArray(size, size, pages.Length, TextureFormat.BC7, true, false);
+				array.wrapMode = TextureWrapMode.Clamp;
+				array.filterMode = FilterMode.Bilinear;
+				for (int p = 0; p < pages.Length; p++) {
+					Texture2D src = new Texture2D(size, size, TextureFormat.RGBA32, true, false);
+					if (KatMips.UseKaiser) {
+						KatMips.Fill(src, pages[p].GetPixels32(), size, false, true);
+					} else {
+						src.SetPixels32(pages[p].GetPixels32(), 0);
+						src.Apply(true, false);
+					}
+					EditorUtility.CompressTexture(src, TextureFormat.BC7, TextureCompressionQuality.Best);
+					for (int mip = 0; mip < src.mipmapCount; mip++) {
+						Graphics.CopyTexture(src, 0, mip, array, p, mip);
+					}
+					UnityEngine.Object.DestroyImmediate(src);
+				}
+				return array;
+			} catch (Exception e) {
+				Debug.LogWarning("KAT Paged: BC7 emoji array failed (" + e.Message + "), falling back to uncompressed RGBA32.");
+				return null;
+			}
+		}
+
+		private static Texture2DArray BuildRgba32Array(Texture2D[] pages, int size)
+		{
+			Texture2DArray array = new Texture2DArray(size, size, pages.Length, TextureFormat.RGBA32, true, false);
+			array.wrapMode = TextureWrapMode.Clamp;
+			array.filterMode = FilterMode.Bilinear;
+			for (int p = 0; p < pages.Length; p++) {
+				if (KatMips.UseKaiser) {
+					Color32[][] chain = KatMips.Chain(pages[p].GetPixels32(), size, false, true);
+					for (int level = 0; level < chain.Length; level++) array.SetPixels32(chain[level], p, level);
+				} else {
+					array.SetPixels32(pages[p].GetPixels32(), p, 0);
+				}
+			}
+			array.Apply(!KatMips.UseKaiser, false);
+			return array;
 		}
 
 		private static void CopyIfPresent(Material from, Material to, params string[] names)
@@ -534,6 +873,10 @@ namespace KillFrenzy.AvatarTextTools.Utility
 		private const string SubMenuName = "KAT Text";
 		private const string SubMenuAssetName = "KAT_Text_Menu";
 		private const string LegacySubMenuAssetName = "KAT_Menu";
+		private const string AdvancedSubMenuName = "Advanced";
+		private const string AdvancedSubMenuAssetName = "KAT_Text_Advanced_Menu";
+		private const string BoardSubMenuName = "Board";
+		private const string BoardSubMenuAssetName = "KAT_Text_Board_Menu";
 
 #if VRC_SDK_VRCSDK3
 		public static bool InstallToMenu(ExpressionsMenu targetMenu, KatSettings settings)
@@ -562,26 +905,78 @@ namespace KillFrenzy.AvatarTextTools.Utility
 			};
 			subMenu.controls.Add(anchor);
 
-			if (settings.InstallStyleSpeedControls) {
-				ExpressionsMenu.Control style = new ExpressionsMenu.Control();
-				style.name = "Text Style";
-				style.type = ExpressionsMenu.Control.ControlType.RadialPuppet;
-				style.subParameters = new ExpressionsMenu.Control.Parameter[] {
-					new ExpressionsMenu.Control.Parameter { name = settings.ParamStyle }
-				};
-				subMenu.controls.Add(style);
+			ExpressionsMenu.Control style = new ExpressionsMenu.Control();
+			style.name = "Text Style";
+			style.type = ExpressionsMenu.Control.ControlType.RadialPuppet;
+			style.subParameters = new ExpressionsMenu.Control.Parameter[] {
+				new ExpressionsMenu.Control.Parameter { name = settings.ParamStyle }
+			};
+			subMenu.controls.Add(style);
 
-				ExpressionsMenu.Control speed = new ExpressionsMenu.Control();
-				speed.name = "Roll Speed";
-				speed.type = ExpressionsMenu.Control.ControlType.RadialPuppet;
-				speed.subParameters = new ExpressionsMenu.Control.Parameter[] {
-					new ExpressionsMenu.Control.Parameter { name = settings.ParamSpeed }
-				};
-				subMenu.controls.Add(speed);
-			}
+			ExpressionsMenu.Control speed = new ExpressionsMenu.Control();
+			speed.name = "Roll Speed";
+			speed.type = ExpressionsMenu.Control.ControlType.RadialPuppet;
+			speed.subParameters = new ExpressionsMenu.Control.Parameter[] {
+				new ExpressionsMenu.Control.Parameter { name = settings.ParamSpeed }
+			};
+			subMenu.controls.Add(speed);
 
 			KatAvatarInstaller.CreateOutputFolder(settings);
 			string folder = "Assets/" + settings.GeneratedOutputFolderName;
+
+			if (settings.InstallBoardControls) {
+				ExpressionsMenu board = ScriptableObject.CreateInstance<ExpressionsMenu>();
+				board.name = BoardSubMenuAssetName;
+				board.controls = new System.Collections.Generic.List<ExpressionsMenu.Control>();
+				// One int, five toggles with different values, so they act like radio buttons. The first one (value 0) is the reset: it is ticked
+				// while the board is docked, and pressing it sends the board back to the head / chest and hands it back to the KAT Text anchor radial.
+				board.controls.Add(MakeToggle("Reset: Back To Body", settings.ParamBoardMode, KatSettings.BoardModeDock));
+				board.controls.Add(MakeToggle("Hold: Left Hand", settings.ParamBoardMode, KatSettings.BoardModeHoldLeft));
+				board.controls.Add(MakeToggle("Hold: Right Hand", settings.ParamBoardMode, KatSettings.BoardModeHoldRight));
+				board.controls.Add(MakeToggle("Drop: In World", settings.ParamBoardMode, KatSettings.BoardModeWorld));
+				board.controls.Add(MakeToggle("Drop: Follow Me", settings.ParamBoardMode, KatSettings.BoardModeFollow));
+
+				string boardPath = AssetDatabase.GenerateUniqueAssetPath(folder + "/" + BoardSubMenuAssetName + ".asset");
+				AssetDatabase.CreateAsset(board, boardPath);
+				EditorUtility.SetDirty(board);
+
+				ExpressionsMenu.Control boardEntry = new ExpressionsMenu.Control();
+				boardEntry.name = BoardSubMenuName;
+				boardEntry.type = ExpressionsMenu.Control.ControlType.SubMenu;
+				boardEntry.subMenu = board;
+				subMenu.controls.Add(boardEntry);
+			}
+
+			if (settings.InstallAdvancedMenu) {
+				ExpressionsMenu advanced = ScriptableObject.CreateInstance<ExpressionsMenu>();
+				advanced.name = AdvancedSubMenuAssetName;
+				advanced.controls = new System.Collections.Generic.List<ExpressionsMenu.Control>();
+				// Billboard is one int shared by two toggles (1 and 2): ticking one unticks the other, and neither means Auto.
+				advanced.controls.Add(MakeToggle("Billboard: Always", settings.ParamAdvBillboard, 1f));
+				advanced.controls.Add(MakeToggle("Billboard: Never", settings.ParamAdvBillboard, 2f));
+				advanced.controls.Add(MakeToggle("Grow With Distance", settings.ParamAdvGrow, 1f));
+				advanced.controls.Add(MakeToggle("Show Box", settings.ParamAdvBox, 1f));
+				advanced.controls.Add(MakeToggle("Shrink Box To Text", settings.ParamAdvShrink, 1f));
+				advanced.controls.Add(MakeToggle("Bold Text", settings.ParamAdvBold, 1f));
+
+				ExpressionsMenu.Control size = new ExpressionsMenu.Control();
+				size.name = "Board Size";
+				size.type = ExpressionsMenu.Control.ControlType.RadialPuppet;
+				size.subParameters = new ExpressionsMenu.Control.Parameter[] {
+					new ExpressionsMenu.Control.Parameter { name = settings.ParamAdvSize }
+				};
+				advanced.controls.Add(size);
+
+				string advancedPath = AssetDatabase.GenerateUniqueAssetPath(folder + "/" + AdvancedSubMenuAssetName + ".asset");
+				AssetDatabase.CreateAsset(advanced, advancedPath);
+				EditorUtility.SetDirty(advanced);
+
+				ExpressionsMenu.Control advancedEntry = new ExpressionsMenu.Control();
+				advancedEntry.name = AdvancedSubMenuName;
+				advancedEntry.type = ExpressionsMenu.Control.ControlType.SubMenu;
+				advancedEntry.subMenu = advanced;
+				subMenu.controls.Add(advancedEntry);
+			}
 
 			string subPath = AssetDatabase.GenerateUniqueAssetPath(folder + "/" + SubMenuAssetName + ".asset");
 			AssetDatabase.CreateAsset(subMenu, subPath);
@@ -597,6 +992,16 @@ namespace KillFrenzy.AvatarTextTools.Utility
 			AssetDatabase.SaveAssets();
 			Debug.Log("KAT Paged: added the \"" + SubMenuName + "\" submenu.");
 			return true;
+		}
+
+		private static ExpressionsMenu.Control MakeToggle(string name, string parameter, float value)
+		{
+			ExpressionsMenu.Control control = new ExpressionsMenu.Control();
+			control.name = name;
+			control.type = ExpressionsMenu.Control.ControlType.Toggle;
+			control.parameter = new ExpressionsMenu.Control.Parameter { name = parameter };
+			control.value = value;
+			return control;
 		}
 
 		public static bool RemoveFromMenu(ExpressionsMenu targetMenu, KatSettings settings)
@@ -617,10 +1022,26 @@ namespace KillFrenzy.AvatarTextTools.Utility
 					assetPath.StartsWith("Assets/" + settings.GeneratedOutputFolderName + "/", StringComparison.Ordinal);
 				if (!ours) continue;
 
+				// The Advanced and Board submenus live inside ours. Note their assets first, because deleting the parent breaks the reference.
+				System.Collections.Generic.List<string> nestedOwned = new System.Collections.Generic.List<string>();
+				if (control.subMenu.controls != null) {
+					foreach (ExpressionsMenu.Control inner in control.subMenu.controls) {
+						if (inner == null || inner.type != ExpressionsMenu.Control.ControlType.SubMenu || inner.subMenu == null) continue;
+						string innerPath = AssetDatabase.GetAssetPath(inner.subMenu);
+						if ((inner.subMenu.name == AdvancedSubMenuAssetName || inner.subMenu.name == BoardSubMenuAssetName) &&
+							innerPath.StartsWith("Assets/" + settings.GeneratedOutputFolderName + "/", StringComparison.Ordinal)) {
+							nestedOwned.Add(innerPath);
+						}
+					}
+				}
+
 				targetMenu.controls.RemoveAt(i);
 				removed = true;
 				if (!string.IsNullOrEmpty(assetPath)) {
 					AssetDatabase.DeleteAsset(assetPath);
+				}
+				foreach (string nested in nestedOwned) {
+					AssetDatabase.DeleteAsset(nested);
 				}
 			}
 

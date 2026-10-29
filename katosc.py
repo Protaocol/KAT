@@ -675,7 +675,7 @@ class KatOsc:
         """Distinct characters of ``text`` that will appear as the fallback glyph (not in the charset, or on a page the
         avatar's format cannot address)."""
         out: dict[str, None] = {}
-        for ch in text:
+        for ch in self.charset.expand_emoji(text):
             if ch.isspace() and ch != "\u3000":
                 continue
             if ch == "\u3000":
@@ -699,6 +699,7 @@ class KatOsc:
         width = self.line_length
         group = self.sync_params or 1
         slots: list[int] = []
+        text = self.charset.expand_emoji(text)   # :sob: and friends become one glyph each (does nothing if the charset has no emoji)
         lines = text.split("\n")
         for n, line in enumerate(lines):
             start = len(slots)

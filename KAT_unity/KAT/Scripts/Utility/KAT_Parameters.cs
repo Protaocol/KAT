@@ -50,7 +50,9 @@ namespace KillFrenzy.AvatarTextTools.Utility
 					name.StartsWith(settings.ParamTextPageSyncPrefix, System.StringComparison.Ordinal) ||
 					name == settings.ParamHeadAnchor ||
 					name == settings.ParamSpeed ||
-					name == settings.ParamStyle;
+					name == settings.ParamStyle ||
+					name.StartsWith(settings.ParamAdvPrefix, System.StringComparison.Ordinal) ||
+					name.StartsWith(settings.ParamBoardPrefix, System.StringComparison.Ordinal);
 			}
 
 			private static ExpressionParameter Make(string name, ExpressionParameters.ValueType type, float defaultValue, bool saved, bool synced = true)
@@ -99,9 +101,22 @@ namespace KillFrenzy.AvatarTextTools.Utility
 				parameters.Add(Make(settings.ParamHeadAnchor, ExpressionParameters.ValueType.Float,
 					settings.AttachmentPoint == KatAttachmentPoint.Head ? 0.2f : 0f, true));
 
-				if (settings.InstallStyleSpeedControls) {
-					parameters.Add(Make(settings.ParamSpeed, ExpressionParameters.ValueType.Float, 0.5f, true, false));
-					parameters.Add(Make(settings.ParamStyle, ExpressionParameters.ValueType.Float, 0.5f, true, false));
+				parameters.Add(Make(settings.ParamSpeed, ExpressionParameters.ValueType.Float, 0.5f, true, false));
+				parameters.Add(Make(settings.ParamStyle, ExpressionParameters.ValueType.Float, 0.5f, true, false));
+
+				if (settings.InstallBoardControls) {
+					// A synced int (8 bits), so everyone sees where the board is held or dropped. Not saved, so it starts docked every time.
+					parameters.Add(Make(settings.ParamBoardMode, ExpressionParameters.ValueType.Int, 0f, false, true));
+				}
+
+				if (settings.InstallAdvancedMenu) {
+					// Local only: these use up expression entries but no synced bits.
+					parameters.Add(Make(settings.ParamAdvBillboard, ExpressionParameters.ValueType.Int, 0f, true, false));
+					parameters.Add(Make(settings.ParamAdvGrow, ExpressionParameters.ValueType.Bool, 1f, true, false));
+					parameters.Add(Make(settings.ParamAdvBox, ExpressionParameters.ValueType.Bool, 1f, true, false));
+					parameters.Add(Make(settings.ParamAdvShrink, ExpressionParameters.ValueType.Bool, 1f, true, false));
+					parameters.Add(Make(settings.ParamAdvBold, ExpressionParameters.ValueType.Bool, 0f, true, false));
+					parameters.Add(Make(settings.ParamAdvSize, ExpressionParameters.ValueType.Float, 0.5f, true, false));
 				}
 
 				targetParameters.parameters = parameters.ToArray();

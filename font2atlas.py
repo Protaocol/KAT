@@ -23,7 +23,7 @@ import build_charset
 from kat_codec import max_wide
 
 
-def default_wide_count(page_format: int) -> int:
+def default_wide_count(page_format: int, reserved_pages: int = 0) -> int:
     """Number of ranked glyphs to add after reserving the built-in punctuation.
 
     The default ranked list contains CJK ideographs, so each selected ranked glyph
@@ -31,7 +31,8 @@ def default_wide_count(page_format: int) -> int:
     format capacity therefore fills the format without overflowing it.
     """
     seed_wide = len(dict.fromkeys(ch for ch in build_charset.WIDE_PUNCT if ch not in build_charset.NARROW_BASE))
-    return max(0, max_wide(page_format) - seed_wide)
+    # emoji pages come out of the same page budget as the text pages
+    return max(0, max_wide(page_format) - reserved_pages * 255 - seed_wide)
 
 
 def sha256(path: Path) -> str:
@@ -48,7 +49,7 @@ def confirm_replace(charset_out: Path, atlas_out: Path) -> bool:
     if charset_out.exists():
         existing.append(str(charset_out))
     generated_atlas = atlas_out.is_dir() and (
-        any(atlas_out.glob("page_*.png")) or (atlas_out / "atlas_meta.json").exists()
+        any(atlas_out.glob("page_*.png")) or any(atlas_out.glob("color_page_*.png")) or (atlas_out / "atlas_meta.json").exists()
     )
     if generated_atlas:
         existing.append(str(atlas_out))
@@ -69,14 +70,14 @@ def confirm_replace(charset_out: Path, atlas_out: Path) -> bool:
 def replace_generated_atlas(staged_atlas: Path, atlas_out: Path) -> None:
     """Install a completed atlas while preserving unrelated files in atlas_out."""
     atlas_out.mkdir(parents=True, exist_ok=True)
-    for stale in atlas_out.glob("page_*.png"):
+    for stale in list(atlas_out.glob("page_*.png")) + list(atlas_out.glob("color_page_*.png")):
         if stale.is_file():
             stale.unlink()
     meta = atlas_out / "atlas_meta.json"
     if meta.exists() and meta.is_file():
         meta.unlink()
     for generated in staged_atlas.iterdir():
-        if generated.is_file() and (generated.name.startswith("page_") and generated.suffix.lower() == ".png"
+        if generated.is_file() and ((generated.name.startswith(("page_", "color_page_")) and generated.suffix.lower() == ".png")
                                     or generated.name == "atlas_meta.json"):
             os.replace(generated, atlas_out / generated.name)
 
@@ -87,6 +88,10 @@ def create_parser() -> argparse.ArgumentParser:
     ap.add_argument("font", help="input .ttf/.otf font (for a specific .ttc face, use the advanced tools)")
     ap.add_argument("--protocol", type=int, choices=(2, 3), default=2,
                     help="paged format: 2 (default, 3,570 wide glyphs) or 3 (large, up to 64,515)")
+    ap.add_argument("--emoji", default="", help='emoji to include, typed here, e.g. "😭😂❤️" (drawn from your font, or the system emoji font)')
+    ap.add_argument("--emoji-dir", help="folder of emoji images; the file name is the shortcode (sob.png -> :sob:)")
+    ap.add_argument("--symbols", choices=("auto", "on", "off"), default="auto",
+                    help="roman numerals, arrows, maths... auto = only with --protocol 3 when there's plenty of room")
     return ap
 
 
@@ -115,10 +120,17 @@ def main(argv: list[str] | None = None) -> int:
     if not confirm_replace(charset_out, atlas_out):
         return 1
 
-    count = default_wide_count(args.protocol)
+    try:
+        import kat_emoji
+        emojis = kat_emoji.collect_emoji(inline=args.emoji, emoji_dir=args.emoji_dir)
+    except (ValueError, OSError) as exc:
+        ap.error(str(exc))
+    count = default_wide_count(args.protocol, emojis.pages())
     print(f"Font: {font}")
     print(f"Paged format: {args.protocol}")
     print(f"Wide glyph target: up to {count:,} ranked glyphs plus built-in punctuation")
+    if emojis:
+        print(f"Emoji: {len(emojis.color)} ({len(emojis.aliases)} with a shortcode), {emojis.pages()} emoji page(s), BC7 in Unity")
     print("Output: charset.json and atlas/ (in the current directory)")
 
     with tempfile.TemporaryDirectory(prefix=".font2atlas-", dir=str(Path.cwd())) as work_name:
@@ -142,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
             punct=build_charset.WIDE_PUNCT,
             narrow=build_charset.NARROW_BASE,
             out=str(staged_charset),
+            emoji=args.emoji, emoji_dir=args.emoji_dir, symbols=args.symbols,
+            symbols_font=str(font), symbols_font_index=0,
         )
         if rc != 0:
             print("Charset generation failed; existing outputs were left unchanged.", file=sys.stderr)
@@ -158,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
             supersample=4,
             strict=False,
             out=str(staged_atlas),
+            emoji_dir=args.emoji_dir,
         )
         if rc != 0:
             print("Atlas generation failed; existing outputs were left unchanged.", file=sys.stderr)

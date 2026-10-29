@@ -143,6 +143,20 @@ class AppController:
         cs = self.kat.charset
         return "".join(o if cs.contains(o) else c for o, c in zip(text, converted))
 
+    # A shortcode like :some_long_emoji_name: is typed in full before it shrinks to one glyph, so the box has to take a little more than it can show while
+    # one is being typed. That is allowed only when a ':' sits between the 2nd-last and the 34th-last character (an opening colon close enough for the
+    # name to still be coming). Anything else over the limit is refused as before, and the layout cuts what doesn't fit, so nothing extra is ever drawn.
+    OVERFLOW = 32
+
+    @classmethod
+    def may_overflow(cls, text: str) -> bool:
+        return ":" in text[-(cls.OVERFLOW + 2):]
+
+    def _fits(self, text: str) -> bool:
+        used = self.kat.measure_text_slots(text)
+        cap = self.kat.text_length
+        return used <= cap or (used <= cap + self.OVERFLOW and self.may_overflow(text))
+
     def fit(self, text: str, cursor: int | None = None) -> TextUpdate:
         """Cut ``text`` to what fits in the textbox. If something was just inserted (compared with the previous text),
         the overflowing part of the INSERTION is dropped, so typing into a full box is refused instead of silently
@@ -150,7 +164,7 @@ class AppController:
         kat = self.kat
         cap = kat.text_length
         cursor = len(text) if cursor is None else max(0, min(cursor, len(text)))
-        if kat.measure_text_slots(text) <= cap:
+        if self._fits(text):
             return TextUpdate(text, cursor, False, kat.measure_text_slots(text, padded=False), cap)
 
         prev = self._last_text
@@ -163,7 +177,7 @@ class AppController:
         head, inserted, tail = text[:a], text[a:len(text) - b], text[len(text) - b:]
 
         def fits(keep: int) -> bool:
-            return kat.measure_text_slots(head + inserted[:keep] + tail) <= cap
+            return self._fits(head + inserted[:keep] + tail)
 
         if fits(0):
             lo, hi = 0, len(inserted)                          # largest prefix of the insertion that still fits
@@ -175,7 +189,7 @@ class AppController:
             lo, hi = 0, len(text)
             while lo < hi:
                 mid = (lo + hi + 1) // 2
-                lo, hi = (mid, hi) if kat.measure_text_slots(text[:mid]) <= cap else (lo, mid - 1)
+                lo, hi = (mid, hi) if self._fits(text[:mid]) else (lo, mid - 1)
             result, cursor = text[:lo], min(cursor, lo)
         return TextUpdate(result, cursor, True, kat.measure_text_slots(result, padded=False), cap)
 
